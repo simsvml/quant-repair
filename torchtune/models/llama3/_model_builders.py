@@ -8,11 +8,11 @@ from functools import partial
 
 from torch import nn
 
-from torchtune.models.llama3._component_builders import llama3, lora_llama3
+from torchtune.models.llama3._component_builders import llama3, lora_llama3, llama3_prefix, llama3_single_layer
 from torchtune.models.llama3._model_utils import scale_hidden_dim_for_mlp
 
-from torchtune.modules import TransformerDecoder
-from torchtune.modules.tokenizers import TikTokenTokenizer
+from torchtune.modules import TransformerDecoder, TransformerDecoderLayer, TransformerDecoderPrefix
+from torchtune.modules.tokenizers import TikTokenTokenizer, TransformersTokenizer
 from torchtune.modules.peft import LORA_ATTN_MODULES
 
 
@@ -69,6 +69,11 @@ def llama3_tokenizer(path: str) -> TikTokenTokenizer:
     tiktoken = TikTokenTokenizer(path)
     tiktoken.pad_id = 0
     return tiktoken
+
+def llama3_tokenizer_transformers(path: str) -> TransformersTokenizer:
+    tt = TransformersTokenizer(path)
+    tt.pad_id = 0
+    return tt
 
 
 def lora_llama3_8b(
@@ -180,3 +185,33 @@ Builder for creating a Llama3 model with QLoRA enabled. Base model weights in li
 that LoRA is applied to are quantized per the QLoRA paper: https://arxiv.org/abs/2305.14314.
 Please see `lora_llama3_8b` for full API arguments.
 """
+
+
+def llama3_8b_prefix(
+    target_layer: int
+) -> TransformerDecoderPrefix:
+    return llama3_prefix(
+        vocab_size=128_256,
+        num_layers=32,
+        num_heads=32,
+        num_kv_heads=8,
+        embed_dim=4096,
+        max_seq_len=8192,
+        intermediate_dim=14336,
+        attn_dropout=0.0,
+        norm_eps=1e-5,
+        rope_base=500000.0,
+        target_layer=target_layer,
+    )
+
+def llama3_8b_single_layer() -> TransformerDecoderLayer:
+    return llama3_single_layer(
+        num_heads=32,
+        num_kv_heads=8,
+        embed_dim=4096,
+        max_seq_len=8192,
+        intermediate_dim=14336,
+        attn_dropout=0.0,
+        norm_eps=1e-5,
+        rope_base=500000.0,
+    )

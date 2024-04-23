@@ -114,6 +114,13 @@ _ALL_RECIPES = [
         supports_distributed=True,
     ),
     Recipe(
+        name="quantize_layer_bitnet",
+        file_path="quantize_layer_bitnet.py",
+        configs=[
+        ],
+        supports_distributed=False,
+    ),
+    Recipe(
         name="generate",
         file_path="generate.py",
         configs=[

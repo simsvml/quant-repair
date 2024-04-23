@@ -19,6 +19,7 @@ from torchtune.modules import (
     RotaryPositionalEmbeddings,
     TransformerDecoder,
     TransformerDecoderLayer,
+    TransformerDecoderPrefix,
 )
 
 from torchtune.modules.common_utils import reparametrize_as_dtype_state_dict_post_hook
@@ -407,4 +408,97 @@ def lora_llama3_mlp(
         gate_proj=gate_proj,
         down_proj=down_proj,
         up_proj=up_proj,
+    )
+
+
+# ------------------ Llama3 for per-layer distillation ------------------
+
+def llama3_prefix(
+    vocab_size: int,
+    num_layers: int,
+    num_heads: int,
+    num_kv_heads: int,
+    embed_dim: int,
+    max_seq_len: int,
+    target_layer: int,
+    attn_dropout: float = 0.0,
+    rope_base: int = 500000.0,
+    intermediate_dim: Optional[int] = None,
+    norm_eps: float = 1e-5,
+) -> TransformerDecoderPrefix:
+    """
+    Like `llama3`, but returns a `TransformerDecoderPrefix` that gives the
+    input and output embeddings of `target_layer`.
+    """
+    head_dim = embed_dim // num_heads
+    num_kv_heads = num_kv_heads if num_kv_heads else num_heads
+    rope = RotaryPositionalEmbeddings(dim=head_dim, max_seq_len=max_seq_len, base=rope_base)
+    self_attn = CausalSelfAttention(
+        embed_dim=embed_dim,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        q_proj=nn.Linear(embed_dim, num_heads * head_dim, bias=False),
+        k_proj=nn.Linear(embed_dim, num_kv_heads * head_dim, bias=False),
+        v_proj=nn.Linear(embed_dim, num_kv_heads * head_dim, bias=False),
+        output_proj=nn.Linear(embed_dim, embed_dim, bias=False),
+        pos_embeddings=rope,
+        max_seq_len=max_seq_len,
+        attn_dropout=attn_dropout,
+    )
+    hidden_dim = intermediate_dim if intermediate_dim else scale_hidden_dim_for_mlp(embed_dim)
+    mlp = llama3_mlp(dim=embed_dim, hidden_dim=hidden_dim)
+    layer = TransformerDecoderLayer(
+        attn=self_attn,
+        mlp=mlp,
+        sa_norm=RMSNorm(dim=embed_dim, eps=norm_eps),
+        mlp_norm=RMSNorm(dim=embed_dim, eps=norm_eps),
+    )
+    tok_embeddings = nn.Embedding(vocab_size, embed_dim)
+    return TransformerDecoderPrefix(
+        tok_embeddings=tok_embeddings,
+        layer=layer,
+        num_layers=num_layers,
+        max_seq_len=max_seq_len,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        target_layer=target_layer,
+    )
+
+def llama3_single_layer(
+    num_heads: int,
+    num_kv_heads: int,
+    embed_dim: int,
+    max_seq_len: int,
+    attn_dropout: float = 0.0,
+    rope_base: int = 500000.0,
+    intermediate_dim: Optional[int] = None,
+    norm_eps: float = 1e-5,
+) -> TransformerDecoderLayer:
+    """
+    Build a single layer of `llama3`.
+    """
+    head_dim = embed_dim // num_heads
+    num_kv_heads = num_kv_heads if num_kv_heads else num_heads
+    rope = RotaryPositionalEmbeddings(dim=head_dim, max_seq_len=max_seq_len, base=rope_base)
+    self_attn = CausalSelfAttention(
+        embed_dim=embed_dim,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        q_proj=nn.Linear(embed_dim, num_heads * head_dim, bias=False),
+        k_proj=nn.Linear(embed_dim, num_kv_heads * head_dim, bias=False),
+        v_proj=nn.Linear(embed_dim, num_kv_heads * head_dim, bias=False),
+        output_proj=nn.Linear(embed_dim, embed_dim, bias=False),
+        pos_embeddings=rope,
+        max_seq_len=max_seq_len,
+        attn_dropout=attn_dropout,
+    )
+    hidden_dim = intermediate_dim if intermediate_dim else scale_hidden_dim_for_mlp(embed_dim)
+    mlp = llama3_mlp(dim=embed_dim, hidden_dim=hidden_dim)
+    return TransformerDecoderLayer(
+        attn=self_attn,
+        mlp=mlp,
+        sa_norm=RMSNorm(dim=embed_dim, eps=norm_eps),
+        mlp_norm=RMSNorm(dim=embed_dim, eps=norm_eps),
     )

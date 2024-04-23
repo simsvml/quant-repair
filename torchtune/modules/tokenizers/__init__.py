@@ -6,6 +6,7 @@
 
 from ._sentencepiece import SentencePieceTokenizer
 from ._tiktoken import TikTokenTokenizer
+from ._transformers import TransformersTokenizer
 from ._utils import Tokenizer
 
-__all__ = ["SentencePieceTokenizer", "TikTokenTokenizer", "Tokenizer"]
+__all__ = ["SentencePieceTokenizer", "TikTokenTokenizer", "TransformersTokenizer", "Tokenizer"]
