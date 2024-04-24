@@ -103,6 +103,24 @@ def transform_opt_state_dict(
     return optim_state_dict_to_load
 
 
+def load_gguf(path: Path) -> Dict[str, Any]:
+    from gguf import GGUFReader, GGMLQuantizationType
+
+    reader = GGUFReader(path)
+    state_dict: Dict[str, Any] = {}
+    quant_map: Dict[str, str] = {}
+    for i, tensor in enumerate(reader.tensors):
+        shape_length = max((j + 1 for j, dim in enumerate(tensor.shape) if dim != 1),
+            default=len(tensor.shape))
+        shape = tuple(reversed(tensor.shape[:shape_length]))
+        print(tensor.name, tensor.data.shape, shape, tensor.shape)
+
+        state_dict[tensor.name] = torch.from_numpy(tensor.data).view(*shape)
+        quant_map[tensor.name] = GGMLQuantizationType(tensor.tensor_type)
+    state_dict['gguf_quant_map'] = quant_map
+    return state_dict
+
+
 def save_config(path: Path, config: Dict[str, Any]) -> None:
     """
     Save a configuration dictionary to a file.

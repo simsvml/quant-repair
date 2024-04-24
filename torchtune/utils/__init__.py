@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from ._checkpointing import (  # noqa
+    FullModelGGUFCheckpointer,
     FullModelHFCheckpointer,
     FullModelMetaCheckpointer,
     FullModelTorchTuneCheckpointer,

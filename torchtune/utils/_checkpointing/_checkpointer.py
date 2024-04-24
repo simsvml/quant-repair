@@ -19,6 +19,7 @@ from torchtune.utils._checkpointing._checkpointer_utils import (
     get_path,
     ModelType,
     safe_torch_load,
+    load_gguf,
     save_config,
 )
 from torchtune.utils.logging import get_logger
@@ -546,6 +547,132 @@ class FullModelMetaCheckpointer(_CheckpointerInterface):
 
         if self._adapter_checkpoint:
             adapter_state_dict = safe_torch_load(self._adapter_checkpoint)
+            state_dict[utils.ADAPTER_KEY] = adapter_state_dict
+
+        if self._resume_from_checkpoint:
+            recipe_state = safe_torch_load(self._recipe_checkpoint)
+            state_dict.update(recipe_state)
+        return state_dict
+
+    def save_checkpoint(
+        self,
+        state_dict: Dict[str, Any],
+        epoch: int,
+        intermediate_checkpoint: bool = False,
+    ) -> None:
+        """
+        Save TorchTune checkpoint to file. If ``intermediate_checkpoint`` is True, an additional
+        checkpoint file ``recipe_state.pt`` is created in ``_output_dir`` which contains the recipe
+        state.
+
+        Args:
+            state_dict (Dict[str, Any]): Checkpoint state dict to be written out to file
+            epoch (int): Epoch number. Used to create the checkpoint file name
+            intermediate_checkpoint (bool): If True, an additional checkpoint files for recipe state
+                and (if applicable) adapter weights are created. Default is False
+        """
+        self._output_dir.mkdir(exist_ok=True)
+        model_state_dict = state_dict[utils.MODEL_KEY]
+        state_dict[utils.MODEL_KEY] = convert_weights.tune_to_meta(model_state_dict)
+
+        # Output file is always a .pt file with the epoch number in the name
+        checkpoint_file = Path.joinpath(
+            self._output_dir, f"meta_model_{epoch}"
+        ).with_suffix(".pt")
+        torch.save(state_dict[utils.MODEL_KEY], checkpoint_file)
+        logger.info(
+            "Model checkpoint of size "
+            f"{os.path.getsize(checkpoint_file) / 1000**3:.2f} GB "
+            f"saved to {checkpoint_file}"
+        )
+
+        if utils.ADAPTER_KEY in state_dict:
+            output_path = Path.joinpath(
+                self._output_dir, f"adapter_{epoch}"
+            ).with_suffix(".pt")
+            torch.save(state_dict[utils.ADAPTER_KEY], output_path)
+            logger.info(
+                "Adapter checkpoint of size "
+                f"{os.path.getsize(output_path) / 1000**3:.2f} GB "
+                f"saved to {output_path}"
+            )
+
+        # If the recipe state needs to be output, first remove the model state dict
+        # and if it exists, remove the adapter state dict as well
+        if intermediate_checkpoint:
+            _ = state_dict.pop(utils.MODEL_KEY)
+            _ = state_dict.pop(utils.ADAPTER_KEY, None)
+            output_path = Path.joinpath(self._output_dir, "recipe_state.pt")
+            torch.save(state_dict, output_path)
+            logger.info(
+                "Recipe checkpoint of size "
+                f"{os.path.getsize(output_path) / 1000**3:.2f} GB "
+                f"saved to {output_path}"
+            )
+
+
+class FullModelGGUFCheckpointer(_CheckpointerInterface):
+    """
+    Checkpointer that reads and writes models in llama.cpp GGUF format.
+
+    Recipe state still uses `torch.save` format, so it can contain arbitrary
+    Python data.  Models and adapters are stored as GGUF, and must be dicts of
+    tensors.
+    """
+
+    def __init__(
+        self,
+        checkpoint_dir: str,
+        checkpoint_files: List[str],
+        model_type: ModelType,
+        output_dir: str,
+        adapter_checkpoint: Optional[str] = None,
+        recipe_checkpoint: Optional[str] = None,
+        resume_from_checkpoint: bool = False,
+    ) -> None:
+        # Fail fast if ``checkpoint_files`` is invalid
+        if len(checkpoint_files) != 1:
+            raise ValueError(
+                "Currently we only support reading from a single GGUF checkpoint file. "
+                f"Got {len(checkpoint_files)} files instead."
+            )
+
+        self._checkpoint_dir = Path(checkpoint_dir)
+        self._checkpoint_path = get_path(self._checkpoint_dir, checkpoint_files[0])
+
+        self._adapter_checkpoint = (
+            get_path(self._checkpoint_dir, adapter_checkpoint)
+            if adapter_checkpoint
+            else None
+        )
+
+        self._resume_from_checkpoint = resume_from_checkpoint
+        self._model_type = model_type
+        self._output_dir = Path(output_dir)
+
+        # recipe_checkpoint contains the recipe state. This should be available if
+        # resume_from_checkpoint is True
+        self._recipe_checkpoint = None
+        if self._resume_from_checkpoint:
+            if recipe_checkpoint is None:
+                raise ValueError(
+                    "If resume_from_checkpoint is True, recipe_checkpoint file must be provided."
+                )
+            self._recipe_checkpoint = get_path(self._checkpoint_dir, recipe_checkpoint)
+
+    def load_checkpoint(self) -> Dict[str, Any]:
+        """
+        Load TorchTune checkpoint from file. Currently only loading from a single file is supported.
+        """
+        from gguf import GGUFReader, GGMLQuantizationType
+
+        state_dict: Dict[str:Any] = {}
+
+        model_state_dict = load_gguf(self._checkpoint_path)
+        state_dict[utils.MODEL_KEY] = convert_weights.gguf_to_tune(model_state_dict)
+
+        if self._adapter_checkpoint:
+            adapter_state_dict = load_gguf(self._adapter_checkpoint)
             state_dict[utils.ADAPTER_KEY] = adapter_state_dict
 
         if self._resume_from_checkpoint:

@@ -44,10 +44,28 @@ _FROM_HF = {
     "lm_head.weight": "output.weight",
 }
 
+# state dict key mappings from llama.cpp GGUF format to TorchTune's format
+_FROM_GGUF = {
+    "token_embd.weight": "tok_embeddings.weight",
+    "blk.{}.attn_q.weight": "layers.{}.attn.q_proj.weight",
+    "blk.{}.attn_k.weight": "layers.{}.attn.k_proj.weight",
+    "blk.{}.attn_v.weight": "layers.{}.attn.v_proj.weight",
+    "blk.{}.attn_output.weight": "layers.{}.attn.output_proj.weight",
+    "blk.{}.ffn_gate.weight": "layers.{}.mlp.w1.weight",
+    "blk.{}.ffn_up.weight": "layers.{}.mlp.w3.weight",
+    "blk.{}.ffn_down.weight": "layers.{}.mlp.w2.weight",
+    "blk.{}.attn_norm.weight": "layers.{}.sa_norm.scale",
+    "blk.{}.ffn_norm.weight": "layers.{}.mlp_norm.scale",
+    "output_norm.weight": "norm.scale",
+    "output.weight": "output.weight",
+    # Pass through the GGUF quantization info.
+    "gguf_quant_map": "gguf_quant_map",
+}
+
 
 def _get_mapped_key(key: str, mapping_dict: Dict[str, str]) -> str:
     try:
-        if "layers" in key:
+        if "layers" in key or key.startswith("blk."):
             # Replace layer number with "{}" to create key for lookup
             abstract_key = re.sub(r"(\.\d+)", ".{}", key)
             layer_num = re.search(r"\d+", key).group(0)
@@ -102,6 +120,49 @@ def tune_to_meta(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]
     """
     converted_state_dict = {}
     inverted_mapping_dict = {v: k for k, v in _FROM_META.items()}
+
+    for key, value in state_dict.items():
+        new_key = _get_mapped_key(key, inverted_mapping_dict)
+        converted_state_dict[new_key] = value
+
+    return converted_state_dict
+
+
+def gguf_to_tune(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """
+    Convert a state dict from llama.cpp GGUF format to TorchTune's format.
+    State dicts from multiple checkpoint files should be consolidated into a
+    single state dict before calling this function.
+
+    Args:
+        state_dict (Dict[str, torch.Tensor]): State dict in llama.cpp GGUF format.
+
+    Returns:
+        Dict[str, torch.Tensor]: State dict in TorchTune's format.
+    """
+    converted_state_dict = {}
+    for key, value in state_dict.items():
+        if key not in ["rope.freqs"]:  # Skip loading the position embeddings
+            new_key = _get_mapped_key(key, _FROM_GGUF)
+            converted_state_dict[new_key] = value
+
+    return converted_state_dict
+
+
+def tune_to_gguf(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """
+    Convert a state dict from TorchTune's format to llama.cpp GGUF format. This
+    function doesn't handle any sharding or splitting of state dicts. It
+    follows the state_dict IN -> state_dict OUT pattern.
+
+    Args:
+        state_dict (Dict[str, torch.Tensor]): State dict in TorchTune's format.
+
+    Returns:
+        Dict[str, torch.Tensor]: State dict in llama.cpp GGUF format.
+    """
+    converted_state_dict = {}
+    inverted_mapping_dict = {v: k for k, v in _FROM_GGUF.items()}
 
     for key, value in state_dict.items():
         new_key = _get_mapped_key(key, inverted_mapping_dict)
