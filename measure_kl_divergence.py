@@ -4,7 +4,7 @@ import sys
 from tempfile import TemporaryDirectory
 import torch
 from torch import Tensor
-from torchtune.models.llama3 import llama3_8b
+from torchtune.models.llama3 import llama3_8b, llama3_tokenizer_transformers
 from torchtune.utils import FullModelHFCheckpointer, set_default_dtype
 
 
@@ -79,10 +79,22 @@ class SlowTransformerDecoder(torch.nn.Module):
         return output
 
 
+def top_tokens(tokenizer, logits, top_k=3, temperature=1.0):
+    # https://medium.com/@pashashaik/natural-language-generation-from-scratch-in-large-language-models-with-pytorch-4d9379635316
+    next_token_logits = logits[0, -1, :]
+    top_k_logits, top_k_indices = torch.topk(next_token_logits, top_k)
+    top_k_probs = torch.nn.functional.softmax(top_k_logits / temperature, dim=-1)
+    print(next_token_logits.shape)
+    print(top_k_logits)
+    print(top_k_indices)
+    print(top_k_probs)
+    return [(prob.item(), tokenizer.decode(token)) for prob, token in zip(top_k_probs, top_k_indices)]
+
 
 def main():
     with set_default_dtype(torch.bfloat16):
-        run()
+        with torch.no_grad():
+            run()
 
 def run():
     assert len(sys.argv) == 2
@@ -113,7 +125,7 @@ def run():
     model_orig = SlowTransformerDecoder(llama3_8b(), checkpoint_dict['model'])
     model_orig = model_orig.to(device)
 
-    num_layers = model_orig.num_layers
+    num_layers = 32
 
 
     # Load alternate weights
@@ -148,12 +160,26 @@ def run():
     model_alt = model_alt.to(device)
 
 
+    print('load tokenizer')
+    tokenizer = llama3_tokenizer_transformers(os.path.join(dir_path, 'tokenizer.json'))
+
 
     print('test run')
-    x_orig = model_orig.forward(torch.tensor([[65, 66, 67]], device=device, dtype=torch.int))
-    print(x_orig)
-    x_alt = model_alt.forward(torch.tensor([[65, 66, 67]], device=device, dtype=torch.int))
-    print(x_alt)
+    tokens = tokenizer.encode('Hello, my name', add_eos=False)
+            #'<|start_header_id|>system<|end_header_id|>\n\n'
+            #'You are a helpful chatbot assistant.<|eot_id|>'
+            #'<|start_header_id|>user<|end_header_id|>\n\n'
+            #'Hello, my name is John.<|eot_id|>'
+            #'<|start_header_id|>assistant<|end_header_id|>\n\n',
+    print(tokens)
+
+    x_orig = model_orig.forward(torch.tensor([tokens], device=device, dtype=torch.int))
+    print(x_orig[0, -1])
+    print(top_tokens(tokenizer, x_orig, top_k=10))
+
+    x_alt = model_alt.forward(torch.tensor([tokens], device=device, dtype=torch.int))
+    print(x_alt[0, -1])
+    print(top_tokens(tokenizer, x_alt, top_k=10))
 
 
     y_orig = torch.nn.functional.log_softmax(x_orig, dim=-1)
