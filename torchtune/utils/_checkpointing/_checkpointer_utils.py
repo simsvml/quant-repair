@@ -203,6 +203,10 @@ def _gguf_unpack_q6_k(
     qs = qs.reshape(-1, 16, 16)
 
     dequant = True
+    if name.startswith('blk.') and name.split('.')[2] in KEEP_QUANTIZED_PARTS:
+        dequant = False
+    if name == 'output.weight':
+        dequant = False
 
     if not dequant:
         return {
