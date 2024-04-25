@@ -7,7 +7,7 @@
 import json
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -222,19 +222,21 @@ def _gguf_unpack_q6_k(
         return {name: x}
 
 
-def load_gguf(path: Path) -> Dict[str, Any]:
-
+def load_gguf(path: Path, filter_name_prefix: Optional[str] = None) -> Dict[str, Any]:
     reader = GGUFReader(path)
     state_dict: Dict[str, Any] = {}
     quant_map: Dict[str, GGMLQuantizationType] = {}
     for i, tensor in enumerate(reader.tensors):
+        quant = GGMLQuantizationType(tensor.tensor_type)
+        quant_map[tensor.name] = quant
+
+        if filter_name_prefix is not None and not tensor.name.startswith(filter_name_prefix):
+            continue
+
         shape_length = max((j + 1 for j, dim in enumerate(tensor.shape) if dim != 1),
             default=len(tensor.shape))
         shape = tuple(reversed(tensor.shape[:shape_length]))
         print(tensor.name, tensor.data.shape, shape, tensor.shape)
-
-        quant = GGMLQuantizationType(tensor.tensor_type)
-        quant_map[tensor.name] = quant
 
         if tensor.tensor_type in GGUF_SIMPLE_TYPES:
             state_dict[tensor.name] = torch.from_numpy(tensor.data).view(*shape)

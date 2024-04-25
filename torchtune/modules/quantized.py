@@ -45,8 +45,9 @@ class QuantizedTensor(nn.Module):
         # into the latent weight before the integer value changes.  bf16 only
         # has 8 bits of mantissa precision, so small updates applied to large
         # values would be lost.
-        #quant_dtype = torch.float32
-        quant_dtype = torch.float16
+        quant_dtype = torch.float32
+        #quant_dtype = torch.float16
+        #quant_dtype = torch.bfloat16
 
         # TODO: 16x16 is used for Q6_K; might need to vary this for other modes
         self.k_qs = nn.Parameter(
@@ -55,11 +56,17 @@ class QuantizedTensor(nn.Module):
                 torch.empty((num_blocks, 16), dtype=quant_dtype))
         self.k_d = nn.Parameter(torch.empty((num_blocks,)))
 
+        self.output_dtype = torch.get_default_dtype()
+
     def forward(self) -> Tensor:
         qs = round_ste(self.k_qs).clamp(*QS_BOUNDS[self.quant])
+        #assert not torch.isnan(qs).any(), 'got nan in qs'
         scales = round_ste(self.k_scales).clamp(*SCALES_BOUNDS[self.quant])
+        #assert not torch.isnan(scales).any(), 'got nan in scales'
+        #assert not torch.isnan(self.k_d).any(), 'got nan in d'
         xs = (self.k_d.unsqueeze(1) * scales).unsqueeze(2) * qs
-        return xs.view(-1)[:self.num_elems].view(self.shape).to(torch.get_default_dtype())
+        #assert not torch.isnan(xs).any(), 'got nan in xs'
+        return xs.view(-1)[:self.num_elems].view(self.shape).to(self.output_dtype)
 
 class QuantLinear(nn.Module):
     """
@@ -90,7 +97,9 @@ class QuantLinear(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         weight = self.weight_quant.forward()
+        #assert not torch.isnan(weight).any(), 'got nan in weight'
         bias = self.bias_quant.forward() if self.bias_quant is not None else None
+        #assert bias is None or not torch.isnan(bias).any(), 'got nan in bias'
         return nn.functional.linear(x, weight, bias)
 
 

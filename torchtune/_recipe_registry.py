@@ -121,6 +121,13 @@ _ALL_RECIPES = [
         supports_distributed=False,
     ),
     Recipe(
+        name="repair_quantized_layer",
+        file_path="repair_quantized_layer.py",
+        configs=[
+        ],
+        supports_distributed=False,
+    ),
+    Recipe(
         name="generate",
         file_path="generate.py",
         configs=[

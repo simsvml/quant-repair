@@ -629,6 +629,7 @@ class FullModelGGUFCheckpointer(_CheckpointerInterface):
         adapter_checkpoint: Optional[str] = None,
         recipe_checkpoint: Optional[str] = None,
         resume_from_checkpoint: bool = False,
+        load_single_layer: Optional[int] = None,
     ) -> None:
         # Fail fast if ``checkpoint_files`` is invalid
         if len(checkpoint_files) != 1:
@@ -649,6 +650,7 @@ class FullModelGGUFCheckpointer(_CheckpointerInterface):
         self._resume_from_checkpoint = resume_from_checkpoint
         self._model_type = model_type
         self._output_dir = Path(output_dir)
+        self._load_single_layer = load_single_layer
 
         # recipe_checkpoint contains the recipe state. This should be available if
         # resume_from_checkpoint is True
@@ -668,7 +670,13 @@ class FullModelGGUFCheckpointer(_CheckpointerInterface):
 
         state_dict: Dict[str:Any] = {}
 
-        model_state_dict = load_gguf(self._checkpoint_path)
+        model_state_dict = load_gguf(
+            self._checkpoint_path,
+            filter_name_prefix=None if self._load_single_layer is None
+                else 'blk.%d.' % self._load_single_layer,
+        )
+        model_state_dict['gguf_quant_map'] = convert_weights.gguf_to_tune(
+                model_state_dict['gguf_quant_map'])
         state_dict[utils.MODEL_KEY] = convert_weights.gguf_to_tune(model_state_dict)
 
         if self._adapter_checkpoint:
@@ -689,21 +697,33 @@ class FullModelGGUFCheckpointer(_CheckpointerInterface):
         """
         Save TorchTune checkpoint to file. If ``intermediate_checkpoint`` is True, an additional
         checkpoint file ``recipe_state.pt`` is created in ``_output_dir`` which contains the recipe
-        state.
+        state. The output state dicts have the following formats:
+
+            Model:
+                {
+                    "key_1": weight
+                    ...
+                }
+
+            Recipe State:
+                {
+                    "optimizer": ...,
+                    "epoch": ...,
+                    ...
+                }
 
         Args:
-            state_dict (Dict[str, Any]): Checkpoint state dict to be written out to file
-            epoch (int): Epoch number. Used to create the checkpoint file name
-            intermediate_checkpoint (bool): If True, an additional checkpoint files for recipe state
-                and (if applicable) adapter weights are created. Default is False
+            state_dict (Dict[str, Any]): State dict with model and (optionally) recipe state
+            epoch (int): Current epoch number. This is added to the checkpoint file name to ensure
+                we're not overwriting intermediate checkpoint files
+            intermediate_checkpoint (bool): If True, save an additional checkpoint file with the
+                recipe state
         """
         self._output_dir.mkdir(exist_ok=True)
-        model_state_dict = state_dict[utils.MODEL_KEY]
-        state_dict[utils.MODEL_KEY] = convert_weights.tune_to_meta(model_state_dict)
 
         # Output file is always a .pt file with the epoch number in the name
         checkpoint_file = Path.joinpath(
-            self._output_dir, f"meta_model_{epoch}"
+            self._output_dir, f"torchtune_model_{epoch}"
         ).with_suffix(".pt")
         torch.save(state_dict[utils.MODEL_KEY], checkpoint_file)
         logger.info(
@@ -724,7 +744,6 @@ class FullModelGGUFCheckpointer(_CheckpointerInterface):
             )
 
         # If the recipe state needs to be output, first remove the model state dict
-        # and if it exists, remove the adapter state dict as well
         if intermediate_checkpoint:
             _ = state_dict.pop(utils.MODEL_KEY)
             _ = state_dict.pop(utils.ADAPTER_KEY, None)

@@ -7,7 +7,7 @@
 import math
 
 import torch
-from torch.optim.lr_scheduler import LambdaLR
+from torch.optim.lr_scheduler import LambdaLR, ReduceLROnPlateau
 
 
 def get_cosine_schedule_with_warmup(
@@ -50,3 +50,13 @@ def get_cosine_schedule_with_warmup(
         return max(0.0, cosine_lr_multiple)
 
     return LambdaLR(optimizer, lr_lambda, last_epoch)
+
+
+def get_reduce_lr_on_plateau(
+    optimizer: torch.optim.Optimizer,
+    num_training_steps: int,
+    *args,
+    last_epoch: int = -1,
+    **kwargs,
+) -> ReduceLROnPlateau:
+    return ReduceLROnPlateau(optimizer, *args, **kwargs)

@@ -4,6 +4,8 @@ import sys
 from tempfile import TemporaryDirectory
 import torch
 from torch import Tensor
+from torchtune.modules import quantized
+from torchtune.models import convert_weights
 from torchtune.models.llama3 import llama3_8b, llama3_tokenizer_transformers
 from torchtune.utils import FullModelHFCheckpointer, set_default_dtype
 
@@ -149,6 +151,7 @@ def run():
         layer_path = os.path.join(layer_dir, 'adapter_%d.pt' % max_adapter_index)
         print('  ' + layer_path)
         layer_dict = torch.load(layer_path, weights_only=True, map_location='cpu')
+        print('layer', layer_index, sorted(layer_dict.keys()))
         for key, value in layer_dict.items():
             assert key in LAYER_PARAMETERS
             alt_state_dict['layers.%d.%s' % (layer_index, key)] = value
@@ -156,7 +159,17 @@ def run():
 
     print('build alternate model')
 
-    model_alt = SlowTransformerDecoder(llama3_8b(), alt_state_dict)
+    from torchtune.utils._checkpointing._checkpointer_utils import load_gguf
+    gguf_dict = load_gguf(
+        os.path.join(dir_path, 'ggml-model-Q6_K.gguf'),
+        filter_name_prefix = 'dont_load_any_tensors',
+    )
+    quant_map = convert_weights.gguf_to_tune(gguf_dict['gguf_quant_map'])
+    #print(quant_map)
+
+    model_alt_base = llama3_8b()
+    quantized.replace_modules(model_alt_base, quant_map)
+    model_alt = SlowTransformerDecoder(model_alt_base, alt_state_dict)
     model_alt = model_alt.to(device)
 
 
