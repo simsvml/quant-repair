@@ -47,9 +47,10 @@ def run():
     print(sorted(checkpoint_dict['model'].keys()))
 
     quant_map = checkpoint_dict['model'].pop('gguf_quant_map')
+    print(quant_map)
 
-    for k,v in checkpoint_dict['model'].items():
-        print(k, v.shape)
+    #for k,v in checkpoint_dict['model'].items():
+    #    print(k, v.shape)
 
     print('build model')
     model = llama3_8b()

@@ -65,6 +65,7 @@ _FROM_GGUF = {
 
 def _get_mapped_key(key: str, mapping_dict: Dict[str, str]) -> str:
     try:
+        key, quant_delim, part = key.partition('_quant.')
         if "layers" in key or key.startswith("blk."):
             # Replace layer number with "{}" to create key for lookup
             abstract_key = re.sub(r"(\.\d+)", ".{}", key)
@@ -73,6 +74,7 @@ def _get_mapped_key(key: str, mapping_dict: Dict[str, str]) -> str:
             new_key = new_key.format(layer_num)
         else:
             new_key = mapping_dict[key]
+        new_key = new_key + quant_delim + part
     except KeyError as e:
         raise Exception(
             f'Error converting the state dict. Found unexpected key: "{key}". '
