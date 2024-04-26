@@ -27,7 +27,7 @@ model_orig:
 model_layer:
   _component_: torchtune.models.llama3.llama3_8b_single_layer
 
-target_layer: 3
+target_layer: 0
 
 # Tokenizer
 tokenizer:
@@ -65,8 +65,8 @@ resume_from_checkpoint: False
 
 # Dataset and Sampler
 dataset:
-  #_component_: torchtune.datasets.slimorca_dataset
-  _component_: torchtune.datasets.alpaca_cleaned_dataset
+  _component_: torchtune.datasets.slimorca_dataset
+  #_component_: torchtune.datasets.alpaca_cleaned_dataset
   train_on_input: True
 seed: null
 shuffle: True
@@ -81,16 +81,21 @@ optimizer:
 #  weight_decay: 0.01
   #lr: 3e-4
   #lr: 2e-8
-  lr: 5e-9
+  #lr: 5e-9
+  lr: 1e-8
 #lr_scheduler:
 #  _component_: torchtune.modules.get_cosine_schedule_with_warmup
 #  num_warmup_steps: 100
+#lr_scheduler:
+#  _component_: torchtune.modules.lr_schedulers.get_reduce_lr_on_plateau
+#  patience: 20
+#  cooldown: 10
+#  factor: 0.8
+#  eps: 0
 lr_scheduler:
-  _component_: torchtune.modules.lr_schedulers.get_reduce_lr_on_plateau
-  patience: 25
-  cooldown: 15
-  factor: 0.3
-  eps: 0
+  _component_: torchtune.modules.lr_schedulers.get_exponential_schedule
+  start_factor: 1.0
+  end_factor: 0.05
 
 loss:
   #_component_: torch.nn.CosineEmbeddingLoss
@@ -98,8 +103,8 @@ loss:
 
 # Training
 epochs: 1
-max_steps_per_epoch: 400
-#max_steps_per_epoch: null
+#max_steps_per_epoch: 150
+max_steps_per_epoch: null
 gradient_accumulation_steps: 16
 optimizer_in_bwd: False
 compile: True

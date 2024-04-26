@@ -60,3 +60,34 @@ def get_reduce_lr_on_plateau(
     **kwargs,
 ) -> ReduceLROnPlateau:
     return ReduceLROnPlateau(optimizer, *args, **kwargs)
+
+def get_linear_schedule(
+    optimizer: torch.optim.Optimizer,
+    start_factor: float,
+    end_factor: float,
+    num_training_steps: int,
+    last_epoch: int = -1,
+) -> LambdaLR:
+    delta = end_factor - start_factor
+    def lr_lambda(current_step):
+        progress = current_step / max(1, num_training_steps)
+        return start_factor + delta * progress
+
+    return LambdaLR(optimizer, lr_lambda, last_epoch)
+
+def get_exponential_schedule(
+    optimizer: torch.optim.Optimizer,
+    start_factor: float,
+    end_factor: float,
+    num_training_steps: int,
+    last_epoch: int = -1,
+) -> LambdaLR:
+    log_start = math.log(start_factor)
+    log_end = math.log(end_factor)
+    log_delta = log_end - log_start
+    def lr_lambda(current_step):
+        progress = current_step / max(1, num_training_steps)
+        log = log_start + log_delta * progress
+        return math.exp(log)
+
+    return LambdaLR(optimizer, lr_lambda, last_epoch)
