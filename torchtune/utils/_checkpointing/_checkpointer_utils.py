@@ -146,18 +146,39 @@ def _split_bits(
         np.bitwise_and(output_slice, mask, out=output_slice)
     return output
 
-def _gguf_unpack_q6_k(
-    data: npt.NDArray[np.uint8],
-    name: str,
-    shape: Tuple,
-) -> Dict[str, Any]:
-    block_type = np.dtype([
+def _concat_bits(
+    data: npt.NDArray[Any],
+    ranges: List[Tuple[int, int]],
+    dtype=None,
+) -> npt.NDArray[Any]:
+    """
+    Concatenate bits along the last axis of `data` according to `ranges`.  This
+    is the inverse of `_split_bits`, assuming the `ranges` cover all the
+    nonzero bits in the original data.
+    """
+    dtype = dtype if dtype is not None else data.dtype
+    output = np.zeros(data.shape[:-1], dtype)
+    for i, (lo, hi) in enumerate(ranges):
+        data_slice = data[..., i]
+        mask = (1 << (hi - lo)) - 1
+        tmp = np.bitwise_and(data_slice, mask, dtype=dtype, casting='same_kind')
+        np.left_shift(tmp, lo, out=tmp)
+        np.bitwise_or(output, tmp, out=output)
+    return output
+
+
+def _gguf_q6_k_dtype() -> np.dtype:
+    return np.dtype([
         ('ql', np.uint8, QK_K // 2),
         ('qh', np.uint8, QK_K // 4),
         ('scales', np.int8, QK_K // 16),
         ('d', np.float16),
     ])
-    blocks = data.view(block_type)
+
+def _gguf_unpack_q6_k(
+    data: npt.NDArray[np.uint8],
+) -> Tuple[npt.NDArray[np.int8], npt.NDArray[np.int8], npt.NDArray[np.float16]]:
+    blocks = data.view(_gguf_q6_k_dtype())
 
     scales = blocks['scales']
     d = blocks['d']
@@ -202,6 +223,73 @@ def _gguf_unpack_q6_k(
 
     qs = qs.reshape(-1, 16, 16)
 
+    return qs, scales, d
+
+def _gguf_pack_q6_k(
+    qs: npt.NDArray[np.int8],
+    scales: npt.NDArray[np.int8],
+    d: npt.NDArray[np.float16],
+) -> npt.NDArray[np.uint8]:
+    num_blocks = d.shape[0]
+    assert d.shape == (num_blocks,)
+    assert scales.shape == (num_blocks, 16)
+    assert qs.shape == (num_blocks, 16, 16)
+    blocks = np.empty((num_blocks,), _gguf_q6_k_dtype())
+
+    blocks['d'][:] = d
+    blocks['scales'][:, :] = scales
+
+    qs = qs.reshape(-1)
+    # Don't use += here to avoid mutating the argument.
+    qs = qs + 32
+    assert qs.dtype == np.int8
+    qs = qs.astype(np.uint8, copy=False)
+
+    qs = _split_bits(qs, [(0, 4), (4, 6)])
+    ql = qs[..., 0]
+    qh = qs[..., 1]
+
+    # This is the reverse of the ql part of the unpacking procedure.
+    ql = ql.reshape(-1, 2, 2, 64)
+    ql = ql.swapaxes(-1, -2)
+    ql = _concat_bits(ql, [(0, 4), (4, 8)])
+    ql = ql.reshape(blocks['ql'].shape)
+    blocks['ql'][:] = ql
+
+    qh = qh.reshape(-1, 2, 4, 32)
+    qh = qh.swapaxes(-1, -2)
+    qh = _concat_bits(qh, [(0, 2), (2, 4), (4, 6), (6, 8)])
+    qh = qh.reshape(blocks['qh'].shape)
+    blocks['qh'][:] = qh
+
+    return blocks.view(np.uint8)
+
+def _gguf_dequant_q6_k(
+    qs: npt.NDArray[np.int8],
+    scales: npt.NDArray[np.int8],
+    d: npt.NDArray[np.float16],
+) -> npt.NDArray[np.float16]:
+    # Note the order of operations here.  Doing `q * shape` first would produce
+    # a `uint8` output, causing issues with overflow.
+    x = (d.reshape(*d.shape, 1, 1) * scales.reshape(*scales.shape, 1)) * qs
+    return x
+
+def _gguf_load_q6_k(
+    data: npt.NDArray[np.uint8],
+    name: str,
+    shape: Tuple,
+) -> Dict[str, Any]:
+    qs, scales, d = _gguf_unpack_q6_k(data)
+
+#    data2 = _gguf_pack_q6_k(qs, scales, d)
+#    assert data2.shape == data.shape
+#    if (data2 != data).any():
+#        i = np.argwhere(data2 != data)[0, 0]
+#        print(i, data.shape)
+#        print(data[max(0, i - 10) : i + 10])
+#        print(data2[max(0, i - 10) : i + 10])
+#        assert False
+
     dequant = True
     if name.startswith('blk.') and name.split('.')[2] in KEEP_QUANTIZED_PARTS:
         dequant = False
@@ -215,9 +303,7 @@ def _gguf_unpack_q6_k(
             '%s_quant.k_d' % name: torch.from_numpy(d),
             }
     else:
-        # Note the order of operations here.  Doing `q * shape` first would produce
-        # a `uint8` output, causing issues with overflow.
-        x = d.reshape(*d.shape, 1, 1) * scales.reshape(*scales.shape, 1) * qs
+        x = _gguf_dequant_q6_k(qs, scales, d)
         x = torch.from_numpy(x).view(*shape)
         return {name: x}
 
@@ -241,7 +327,7 @@ def load_gguf(path: Path, filter_name_prefix: Optional[str] = None) -> Dict[str,
         if tensor.tensor_type in GGUF_SIMPLE_TYPES:
             state_dict[tensor.name] = torch.from_numpy(tensor.data).view(*shape)
         elif quant == GGMLQuantizationType.Q6_K:
-            state_dict.update(_gguf_unpack_q6_k(tensor.data, tensor.name, shape))
+            state_dict.update(_gguf_load_q6_k(tensor.data, tensor.name, shape))
         else:
             raise ValueError("unsupported quantization %s for %s" % (quant, tensor.name))
     state_dict['gguf_quant_map'] = quant_map

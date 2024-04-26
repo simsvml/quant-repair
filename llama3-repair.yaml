@@ -55,7 +55,7 @@ checkpointer_layer:
   _component_: torchtune.utils.FullModelGGUFCheckpointer
   checkpoint_dir: ./torchtune-llama3-8b-instruct/
   checkpoint_files: [
-    ggml-model-Q6_K.gguf
+    ggml-model-Q6_K-imat.gguf
   ]
   recipe_checkpoint: null
   output_dir: ./torchtune-llama3-8b-instruct/output/${target_layer}/
@@ -95,7 +95,7 @@ optimizer:
 lr_scheduler:
   _component_: torchtune.modules.lr_schedulers.get_exponential_schedule
   start_factor: 1.0
-  end_factor: 0.05
+  end_factor: 0.2
 
 loss:
   #_component_: torch.nn.CosineEmbeddingLoss
@@ -103,8 +103,8 @@ loss:
 
 # Training
 epochs: 1
-#max_steps_per_epoch: 150
-max_steps_per_epoch: null
+max_steps_per_epoch: 200
+#max_steps_per_epoch: null
 gradient_accumulation_steps: 16
 optimizer_in_bwd: False
 compile: True
