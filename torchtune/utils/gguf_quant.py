@@ -44,6 +44,129 @@ def _concat_bits(
     return output
 
 
+def _unpack_k_qs_part(
+    data: npt.NDArray[np.uint8],
+    num_bits: int,
+) -> npt.NDArray[np.uint8]:
+    num_bytes = data.shape[-1]
+    num_parts = 8 // num_bits
+    # Each byte in `data` is divided into `num_parts` parts, each consisting of
+    # `num_bits` bits.  The unpacked sequence consists of the lowest parts of
+    # each byte, then the next-lowest part, and so on.
+    ranges = [(i, i + num_bits) for i in range(0, 8, num_bits)]
+    assert len(ranges) == num_parts
+    qs = _split_bits(data, ranges)
+    # The shape is currently `[..., byte, part]`.  We swap the last two axes to
+    # produce `[..., part, byte]`, so that all the part-0 values come first,
+    # then all the part-1 values, and so on.
+    qs = qs.swapaxes(-1, -2)
+    # Flatten the last two axes to produce a flat sequence of result values.
+    qs = qs.reshape(*data.shape[:-1], num_bytes * num_parts)
+    return qs
+
+def _pack_k_qs_part(
+    qs: npt.NDArray[np.uint8],
+    num_bits: int,
+) -> npt.NDArray[np.uint8]:
+    num_parts = 8 // num_bits
+    assert qs.shape[-1] % num_parts == 0
+    num_bytes = qs.shape[-1] // num_parts
+    # Reverse the operations from `_unpack_k_qs_part`.
+    batch_shape = qs.shape[:-1]
+    # Initial shape is `[..., num_bytes * num_parts]`
+    qs = qs.reshape(*batch_shape, num_parts, num_bytes)
+    qs = qs.swapaxes(-1, -2)
+    # We now have `[..., num_bytes, num_parts]`, suitable for `_concat_bits`.
+    ranges = [(i, i + num_bits) for i in range(0, 8, num_bits)]
+    assert len(ranges) == num_parts
+    data = _concat_bits(qs, ranges)
+    return data
+
+def _unpack_k_qs(
+    ql: npt.NDArray[np.uint8],
+    num_low_bits: int,
+    num_low_sub_blocks: int,
+    qh: Optional[npt.NDArray[np.uint8]] = None,
+    num_high_bits: int = 0,
+    num_high_sub_blocks: int = 0,
+) -> npt.NDArray[np.uint8]:
+    """
+    Unpack K-quant `qs` values from low and high bits.
+    """
+    assert 8 % num_low_bits == 0
+    assert ql.shape[-1] == QK_K // (8 // num_low_bits)
+    assert QK_K % num_low_sub_blocks == 0
+    if qh is not None:
+        assert 8 % num_high_bits == 0
+        assert qh.shape[-1] == QK_K // (8 // num_high_bits)
+        assert qh.shape[:-1] == ql.shape[:-1]
+        assert QK_K % num_high_sub_blocks == 0
+
+    batch_shape = ql.shape[:-1]
+
+    # Divide each block (the last axis) into sub-blocks.  Different K-quants
+    # use different numbers of sub-blocks.
+    bytes_per_low_sub_block = QK_K * num_low_bits // 8 // num_low_sub_blocks
+    ql = ql.reshape(*batch_shape, num_low_sub_blocks, bytes_per_low_sub_block)
+    ql = _unpack_k_qs_part(ql, num_low_bits)
+    ql = ql.reshape(*batch_shape, QK_K)
+
+    if qh is not None:
+        bytes_per_high_sub_block = QK_K * num_high_bits // 8 // num_high_sub_blocks
+        qh = qh.reshape(*batch_shape, num_high_sub_blocks, bytes_per_high_sub_block)
+        qh = _unpack_k_qs_part(qh, num_high_bits)
+        qh = qh.reshape(*batch_shape, QK_K)
+
+        np.left_shift(qh, num_low_bits, out=qh)
+        np.bitwise_or(ql, qh, out=ql)
+
+    return ql
+
+def _pack_k_qs(
+    qs: npt.NDArray[np.uint8],
+    num_low_bits: int,
+    num_low_sub_blocks: int,
+    num_high_bits: int = 0,
+    num_high_sub_blocks: int = 0,
+) -> Tuple[npt.NDArray[np.uint8], Optional[npt.NDArray[np.uint8]]]:
+    """
+    Pack K-quant `qs` values into separate low and high bits.
+    """
+    assert qs.shape[-1] == QK_K
+    assert 8 % num_low_bits == 0
+    assert QK_K % num_low_sub_blocks == 0
+    if num_high_bits != 0:
+        assert 8 % num_high_bits == 0
+        assert QK_K % num_high_sub_blocks == 0
+
+    batch_shape = qs.shape[:-1]
+
+    if num_high_bits != 0:
+        ranges = [(0, num_low_bits), (num_low_bits, num_low_bits + num_high_bits)]
+        qs = _split_bits(qs, ranges)
+        ql = qs[..., 0]
+        qh = qs[..., 1]
+    else:
+        ql = qs
+        qh = None
+
+    # Reverse the operations from `_unpack_k_qs`.
+    elems_per_low_sub_block = QK_K // num_low_sub_blocks
+    ql = ql.reshape(*batch_shape, num_low_sub_blocks, elems_per_low_sub_block)
+    ql = _pack_k_qs_part(ql, num_low_bits)
+    bytes_per_low_block = QK_K * num_low_bits // 8
+    ql = ql.reshape(*batch_shape, bytes_per_low_block)
+
+    if qh is not None:
+        elems_per_high_sub_block = QK_K // num_high_sub_blocks
+        qh = qh.reshape(*batch_shape, num_high_sub_blocks, elems_per_high_sub_block)
+        qh = _pack_k_qs_part(qh, num_high_bits)
+        bytes_per_high_block = QK_K * num_high_bits // 8
+        qh = qh.reshape(*batch_shape, bytes_per_high_block)
+
+    return ql, qh
+
+
 def _q6_k_dtype() -> np.dtype:
     return np.dtype([
         ('ql', np.uint8, QK_K // 2),
@@ -72,28 +195,14 @@ def unpack_q6_k(
     #   finally `6:8`, to get the 128 `qh` values.
     # * Combine each pair by computing `q = (ql | (qh << 4)) - 32` to obtain
     #   the final 6-bit value.
-
-    ql = _split_bits(blocks['ql'], [(0, 4), (4, 8)])
-    # [block, half_block, byte, bits]
-    # Each half-block has 64 `ql` values, split into low bits and high bits.
-    ql = ql.reshape(-1, 2, 64, 2)
-    # Within each half-block, we use all the low bits first, then all the high
-    # bits.
-    ql = ql.swapaxes(-1, -2)
-    # Final output is a sequence of 256 4-bit values per block.
-    ql = ql.reshape(-1, 256)
-
-    qh = _split_bits(blocks['qh'], [(0, 2), (2, 4), (4, 6), (6, 8)])
-    # [block, half_block, byte, bits]
-    # Each half-block has 32 `qh` values, split into four 2-bit values.
-    qh = qh.reshape(-1, 2, 32, 4)
-    qh = qh.swapaxes(-1, -2)
-    qh = qh.reshape(-1, 256)
-
-    np.left_shift(qh, 4, out=qh)
-    np.bitwise_or(ql, qh, out=ql)
-    qs = ql
-    del ql, qh
+    qs = _unpack_k_qs(
+        ql = blocks['ql'],
+        num_low_bits = 4,
+        num_low_sub_blocks = 2,
+        qh = blocks['qh'],
+        num_high_bits = 2,
+        num_high_sub_blocks = 2,
+    )
     assert qs.dtype == np.uint8
     qs = qs.astype(np.int8, copy=False)
     qs -= 32
@@ -116,27 +225,21 @@ def pack_q6_k(
     blocks['d'][:] = d
     blocks['scales'][:, :] = scales
 
-    qs = qs.reshape(-1)
+    qs = qs.reshape(num_blocks, QK_K)
     # Don't use += here to avoid mutating the argument.
     qs = qs + 32
     assert qs.dtype == np.int8
     qs = qs.astype(np.uint8, copy=False)
 
-    qs = _split_bits(qs, [(0, 4), (4, 6)])
-    ql = qs[..., 0]
-    qh = qs[..., 1]
+    ql, qh = _pack_k_qs(
+        qs,
+        num_low_bits = 4,
+        num_low_sub_blocks = 2,
+        num_high_bits = 2,
+        num_high_sub_blocks = 2,
+    )
 
-    # This is the reverse of the ql part of the unpacking procedure.
-    ql = ql.reshape(-1, 2, 2, 64)
-    ql = ql.swapaxes(-1, -2)
-    ql = _concat_bits(ql, [(0, 4), (4, 8)])
-    ql = ql.reshape(blocks['ql'].shape)
     blocks['ql'][:] = ql
-
-    qh = qh.reshape(-1, 2, 4, 32)
-    qh = qh.swapaxes(-1, -2)
-    qh = _concat_bits(qh, [(0, 2), (2, 4), (4, 6), (6, 8)])
-    qh = qh.reshape(blocks['qh'].shape)
     blocks['qh'][:] = qh
 
     return blocks.view(np.uint8)
