@@ -169,6 +169,8 @@ def _pack_k_qs(
     return ql, qh
 
 
+# Q6_K
+
 def _q6_k_dtype() -> np.dtype:
     return np.dtype([
         ('ql', np.uint8, QK_K // 2),
@@ -257,14 +259,7 @@ def dequant_q6_k(
     return x
 
 
-def _q5_k_dtype() -> np.dtype:
-    return np.dtype([
-        ('d', np.float16),
-        ('dmin', np.float16),
-        ('scales', np.uint8, K_SCALE_SIZE),
-        ('qh', np.uint8, QK_K // 8),
-        ('qs', np.uint8, QK_K // 2),
-    ])
+# Q5_K
 
 def _unpack_scale_min_k4(
     data: npt.NDArray[np.uint8],
@@ -349,6 +344,15 @@ def _pack_scale_min_k4(
     np.bitwise_or(data[..., 4:8], tmp, out=data[..., 4:8])
 
     return data
+
+def _q5_k_dtype() -> np.dtype:
+    return np.dtype([
+        ('d', np.float16),
+        ('dmin', np.float16),
+        ('scales', np.uint8, K_SCALE_SIZE),
+        ('qh', np.uint8, QK_K // 8),
+        ('qs', np.uint8, QK_K // 2),
+    ])
 
 def _test_unpack_scale_min_k4(
     data: npt.NDArray[np.uint8],
@@ -469,5 +473,114 @@ def test_unpack_q5_k(
         if (blocks2['qh'] != blocks['qh']).any():
             print('qh mismatch')
         assert False, 'bug in pack/unpack_q5_k'
+
+    return qs, sc, m, d, dmin
+
+
+# Q4_K
+
+def _q4_k_dtype() -> np.dtype:
+    return np.dtype([
+        ('d', np.float16),
+        ('dmin', np.float16),
+        ('scales', np.uint8, K_SCALE_SIZE),
+        ('qs', np.uint8, QK_K // 2),
+    ])
+
+def unpack_q4_k(
+    data: npt.NDArray[np.uint8],
+) -> Tuple[
+    npt.NDArray[np.uint8],
+    npt.NDArray[np.uint8],
+    npt.NDArray[np.uint8],
+    npt.NDArray[np.float16],
+    npt.NDArray[np.float16],
+]:
+    blocks = data.view(_q4_k_dtype())
+
+    d = blocks['d']
+    dmin = blocks['dmin']
+    sc, m = _test_unpack_scale_min_k4(blocks['scales'])
+
+    qs = _unpack_k_qs(
+        ql = blocks['qs'],
+        num_low_bits = 4,
+        num_low_sub_blocks = 4,
+    )
+
+    # Each group of 32 weights uses a common `sc` and `m`.
+    qs = qs.reshape(blocks.shape[0], 8, 32)
+
+    return (qs, sc, m, d, dmin)
+
+def dequant_q4_k(
+    qs: npt.NDArray[np.uint8],
+    sc: npt.NDArray[np.uint8],
+    m: npt.NDArray[np.uint8],
+    d: npt.NDArray[np.float16],
+    dmin: npt.NDArray[np.float16],
+) -> npt.NDArray[np.float16]:
+    scale = d.reshape(*d.shape, 1) * sc
+    minimum = dmin.reshape(*d.shape, 1) * m
+    x = scale.reshape(*scale.shape, 1) * qs - minimum.reshape(*minimum.shape, 1)
+    return x
+
+def pack_q4_k(
+    qs: npt.NDArray[np.uint8],
+    sc: npt.NDArray[np.uint8],
+    m: npt.NDArray[np.uint8],
+    d: npt.NDArray[np.float16],
+    dmin: npt.NDArray[np.float16],
+) -> npt.NDArray[np.uint8]:
+    num_blocks = d.shape[0]
+    assert qs.shape == (num_blocks, 8, 32)
+    assert sc.shape == (num_blocks, 8)
+    assert m.shape == (num_blocks, 8)
+    assert d.shape == (num_blocks,)
+    assert dmin.shape == (num_blocks,)
+    blocks = np.empty((num_blocks,), _q4_k_dtype())
+
+    blocks['d'][:] = d
+    blocks['dmin'][:] = dmin
+    blocks['scales'][:, :] = _pack_scale_min_k4(sc, m)
+
+    qs = qs.reshape(num_blocks, QK_K)
+
+    ql, qh = _pack_k_qs(
+        qs,
+        num_low_bits = 4,
+        num_low_sub_blocks = 4,
+    )
+    assert qh is None
+
+    blocks['qs'][:] = ql
+
+    return blocks.view(np.uint8)
+
+def test_unpack_q4_k(
+    data: npt.NDArray[np.uint8],
+) -> Tuple[
+    npt.NDArray[np.uint8],
+    npt.NDArray[np.uint8],
+    npt.NDArray[np.uint8],
+    npt.NDArray[np.float16],
+    npt.NDArray[np.float16],
+]:
+    qs, sc, m, d, dmin = unpack_q4_k(data)
+
+    data2 = pack_q4_k(qs, sc, m, d, dmin)
+
+    if (data2 != data).any():
+        blocks = data.view(_q4_k_dtype())
+        blocks2 = data2.view(_q4_k_dtype())
+        if (blocks2['d'] != blocks['d']).any():
+            print('d mismatch')
+        if (blocks2['dmin'] != blocks['dmin']).any():
+            print('dmin mismatch')
+        if (blocks2['scales'] != blocks['scales']).any():
+            print('scales mismatch')
+        if (blocks2['qs'] != blocks['qs']).any():
+            print('qs mismatch')
+        assert False, 'bug in pack/unpack_q4_k'
 
     return qs, sc, m, d, dmin
