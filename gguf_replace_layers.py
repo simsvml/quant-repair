@@ -16,8 +16,23 @@ def main():
     print('opening %s' % gguf_path)
     reader = gguf.GGUFReader(gguf_path, 'r+')
 
+    # TODO: Load the latest checkpoint from each output/*/ dir and merge them
+
     prev_layer = None
     prev_layer_dict = None
+
+    has_layer_cache = {}
+    def has_layer(layer):
+        """
+        Check whether at least one optimized checkpoint exists for `layer`.
+        """
+        if layer not in has_layer_cache:
+            layer_dir = os.path.join(layers_dir, str(layer))
+            layer_path = os.path.join(layer_dir, 'torchtune_model_0.pt')
+            has_layer_cache[layer] = os.path.exists(layer_path)
+            if not has_layer_cache[layer]:
+                print('no optimized checkpoint found for layer %d' % layer)
+        return has_layer_cache[layer]
 
     def get_layer_tensor(layer, name):
         nonlocal prev_layer, prev_layer_dict
@@ -38,6 +53,8 @@ def main():
     for tensor in reader.tensors:
         if tensor.name.startswith('blk.'):
             layer = int(tensor.name.split('.')[1])
+            if not has_layer(layer):
+                continue
             if tensor.tensor_type in quantized.UNQUANTIZED_TYPES:
                 layer_tensor = get_layer_tensor(layer, tensor.name)
                 tensor.data[...] = layer_tensor.numpy(force=True)

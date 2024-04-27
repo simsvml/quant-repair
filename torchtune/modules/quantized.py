@@ -31,7 +31,7 @@ class QuantizedTensor(nn.Module):
     def __init__(self, shape, quant) -> None:
         super().__init__()
         self.shape = shape
-        self.quant = quant
+        self._quant = int(quant)
 
         num_elems = 1
         for d in shape:
@@ -57,6 +57,10 @@ class QuantizedTensor(nn.Module):
         self.k_d = nn.Parameter(torch.empty((num_blocks,)))
 
         self.output_dtype = torch.get_default_dtype()
+
+    @property
+    def quant(self) -> GGMLQuantizationType:
+        return GGMLQuantizationType(self._quant)
 
     def forward(self) -> Tensor:
         qs = round_ste(self.k_qs).clamp(*QS_BOUNDS[self.quant])
