@@ -96,28 +96,30 @@ def _unpack_k_qs(
     Unpack K-quant `qs` values from low and high bits.
     """
     assert 8 % num_low_bits == 0
-    assert ql.shape[-1] == QK_K // (8 // num_low_bits)
-    assert QK_K % num_low_sub_blocks == 0
+    block_size = ql.shape[-1] * (8 // num_low_bits)
+    assert block_size % num_low_sub_blocks == 0
     if qh is not None:
         assert 8 % num_high_bits == 0
-        assert qh.shape[-1] == QK_K // (8 // num_high_bits)
+        assert block_size == qh.shape[-1] * (8 // num_high_bits)
         assert qh.shape[:-1] == ql.shape[:-1]
-        assert QK_K % num_high_sub_blocks == 0
+        assert block_size % num_high_sub_blocks == 0
 
     batch_shape = ql.shape[:-1]
 
     # Divide each block (the last axis) into sub-blocks.  Different K-quants
     # use different numbers of sub-blocks.
-    bytes_per_low_sub_block = QK_K * num_low_bits // 8 // num_low_sub_blocks
+    elems_per_low_sub_block = block_size // num_low_sub_blocks
+    bytes_per_low_sub_block = elems_per_low_sub_block * num_low_bits // 8
     ql = ql.reshape(*batch_shape, num_low_sub_blocks, bytes_per_low_sub_block)
     ql = _unpack_k_qs_part(ql, num_low_bits)
-    ql = ql.reshape(*batch_shape, QK_K)
+    ql = ql.reshape(*batch_shape, block_size)
 
     if qh is not None:
-        bytes_per_high_sub_block = QK_K * num_high_bits // 8 // num_high_sub_blocks
+        elems_per_high_sub_block = block_size // num_high_sub_blocks
+        bytes_per_high_sub_block = elems_per_high_sub_block * num_high_bits // 8
         qh = qh.reshape(*batch_shape, num_high_sub_blocks, bytes_per_high_sub_block)
         qh = _unpack_k_qs_part(qh, num_high_bits)
-        qh = qh.reshape(*batch_shape, QK_K)
+        qh = qh.reshape(*batch_shape, block_size)
 
         np.left_shift(qh, num_low_bits, out=qh)
         np.bitwise_or(ql, qh, out=ql)
@@ -134,12 +136,12 @@ def _pack_k_qs(
     """
     Pack K-quant `qs` values into separate low and high bits.
     """
-    assert qs.shape[-1] == QK_K
+    block_size = qs.shape[-1]
     assert 8 % num_low_bits == 0
-    assert QK_K % num_low_sub_blocks == 0
+    assert block_size % num_low_sub_blocks == 0
     if num_high_bits != 0:
         assert 8 % num_high_bits == 0
-        assert QK_K % num_high_sub_blocks == 0
+        assert block_size % num_high_sub_blocks == 0
 
     batch_shape = qs.shape[:-1]
 
@@ -153,17 +155,17 @@ def _pack_k_qs(
         qh = None
 
     # Reverse the operations from `_unpack_k_qs`.
-    elems_per_low_sub_block = QK_K // num_low_sub_blocks
+    elems_per_low_sub_block = block_size // num_low_sub_blocks
     ql = ql.reshape(*batch_shape, num_low_sub_blocks, elems_per_low_sub_block)
     ql = _pack_k_qs_part(ql, num_low_bits)
-    bytes_per_low_block = QK_K * num_low_bits // 8
+    bytes_per_low_block = block_size * num_low_bits // 8
     ql = ql.reshape(*batch_shape, bytes_per_low_block)
 
     if qh is not None:
-        elems_per_high_sub_block = QK_K // num_high_sub_blocks
+        elems_per_high_sub_block = block_size // num_high_sub_blocks
         qh = qh.reshape(*batch_shape, num_high_sub_blocks, elems_per_high_sub_block)
         qh = _pack_k_qs_part(qh, num_high_bits)
-        bytes_per_high_block = QK_K * num_high_bits // 8
+        bytes_per_high_block = block_size * num_high_bits // 8
         qh = qh.reshape(*batch_shape, bytes_per_high_block)
 
     return ql, qh
@@ -584,3 +586,136 @@ def test_unpack_q4_k(
         assert False, 'bug in pack/unpack_q4_k'
 
     return qs, sc, m, d, dmin
+
+
+# Q3_K
+
+def _q3_k_dtype() -> np.dtype:
+    return np.dtype([
+        ('hmask', np.uint8, QK_K // 8),
+        ('qs', np.uint8, QK_K // 4),
+        ('scales', np.uint8, 12),
+        ('d', np.float16),
+    ])
+
+def unpack_q3_k(
+    data: npt.NDArray[np.uint8],
+) -> Tuple[
+    npt.NDArray[np.int8],
+    npt.NDArray[np.int8],
+    npt.NDArray[np.float16],
+]:
+    blocks = data.view(_q3_k_dtype())
+
+    d = blocks['d']
+
+    scales = _unpack_k_qs(
+        ql = blocks['scales'][..., 0:8],
+        num_low_bits = 4,
+        num_low_sub_blocks = 1,
+        qh = blocks['scales'][..., 8:12],
+        num_high_bits = 2,
+        num_high_sub_blocks = 1,
+    )
+    assert scales.dtype == np.uint8
+    scales = scales.astype(np.int8, copy=False)
+    scales -= 32
+
+    qs = _unpack_k_qs(
+        ql = blocks['qs'],
+        num_low_bits = 2,
+        num_low_sub_blocks = 2,
+        qh = blocks['hmask'],
+        num_high_bits = 1,
+        num_high_sub_blocks = 1,
+    )
+    assert qs.dtype == np.uint8
+    qs = qs.astype(np.int8, copy=False)
+    qs -= 4
+
+    # Each group of 16 weights uses a common scale.
+    qs = qs.reshape(blocks.shape[0], 16, 16)
+
+    return (qs, scales, d)
+
+def dequant_q3_k(
+    qs: npt.NDArray[np.int8],
+    scales: npt.NDArray[np.int8],
+    d: npt.NDArray[np.float16],
+) -> npt.NDArray[np.float16]:
+    # Note the order of operations here.  Doing `q * shape` first would produce
+    # a `uint8` output, causing issues with overflow.
+    x = (d.reshape(*d.shape, 1, 1) * scales.reshape(*scales.shape, 1)) * qs
+    return x
+
+def pack_q3_k(
+    qs: npt.NDArray[np.int8],
+    scales: npt.NDArray[np.int8],
+    d: npt.NDArray[np.float16],
+) -> npt.NDArray[np.uint8]:
+    num_blocks = d.shape[0]
+    assert d.shape == (num_blocks,)
+    assert scales.shape == (num_blocks, 16) # FIXME
+    assert qs.shape == (num_blocks, 16, 16)
+    blocks = np.empty((num_blocks,), _q3_k_dtype())
+
+    blocks['d'][:] = d
+
+    # Don't use += here to avoid mutating the argument.
+    scales = scales + 32
+    assert scales.dtype == np.int8
+    scales = scales.astype(np.uint8, copy=False)
+    scales_low, scales_high = _pack_k_qs(
+        scales,
+        num_low_bits = 4,
+        num_low_sub_blocks = 1,
+        num_high_bits = 2,
+        num_high_sub_blocks = 1,
+    )
+    blocks['scales'][..., 0:8] = scales_low
+    blocks['scales'][..., 8:12] = scales_high
+
+    qs = qs.reshape(num_blocks, QK_K)
+    # Don't use += here to avoid mutating the argument.
+    qs = qs + 4
+    assert qs.dtype == np.int8
+    qs = qs.astype(np.uint8, copy=False)
+
+    ql, qh = _pack_k_qs(
+        qs,
+        num_low_bits = 2,
+        num_low_sub_blocks = 2,
+        num_high_bits = 1,
+        num_high_sub_blocks = 1,
+    )
+
+    blocks['qs'][:] = ql
+    blocks['hmask'][:] = qh
+
+    return blocks.view(np.uint8)
+
+def test_unpack_q3_k(
+    data: npt.NDArray[np.uint8],
+) -> Tuple[
+    npt.NDArray[np.int8],
+    npt.NDArray[np.int8],
+    npt.NDArray[np.float16],
+]:
+    qs, scales, d = unpack_q3_k(data)
+
+    data2 = pack_q3_k(qs, scales, d)
+
+    if (data2 != data).any():
+        blocks = data.view(_q3_k_dtype())
+        blocks2 = data2.view(_q3_k_dtype())
+        if (blocks2['hmask'] != blocks['hmask']).any():
+            print('hmask mismatch')
+        if (blocks2['qs'] != blocks['qs']).any():
+            print('qs mismatch')
+        if (blocks2['scales'] != blocks['scales']).any():
+            print('scales mismatch')
+        if (blocks2['d'] != blocks['d']).any():
+            print('d mismatch')
+        assert False, 'bug in pack/unpack_q3_k'
+
+    return qs, scales, d
