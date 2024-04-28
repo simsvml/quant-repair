@@ -719,3 +719,115 @@ def test_unpack_q3_k(
         assert False, 'bug in pack/unpack_q3_k'
 
     return qs, scales, d
+
+
+# Q2_K
+
+def _q2_k_dtype() -> np.dtype:
+    return np.dtype([
+        ('scales', np.uint8, QK_K // 16),
+        ('qs', np.uint8, QK_K // 4),
+        ('d', np.float16),
+        ('dmin', np.float16),
+    ])
+
+def unpack_q2_k(
+    data: npt.NDArray[np.uint8],
+) -> Tuple[
+    npt.NDArray[np.uint8],
+    npt.NDArray[np.uint8],
+    npt.NDArray[np.uint8],
+    npt.NDArray[np.float16],
+    npt.NDArray[np.float16],
+]:
+    blocks = data.view(_q2_k_dtype())
+
+    d = blocks['d']
+    dmin = blocks['dmin']
+
+    sc = blocks['scales'] & 0xf
+    m = blocks['scales'] >> 4
+
+    qs = _unpack_k_qs(
+        ql = blocks['qs'],
+        num_low_bits = 2,
+        num_low_sub_blocks = 2,
+    )
+
+    # Each group of 16 weights uses a common `sc` and `m`.
+    qs = qs.reshape(blocks.shape[0], 16, 16)
+
+    return (qs, sc, m, d, dmin)
+
+def dequant_q2_k(
+    qs: npt.NDArray[np.uint8],
+    sc: npt.NDArray[np.uint8],
+    m: npt.NDArray[np.uint8],
+    d: npt.NDArray[np.float16],
+    dmin: npt.NDArray[np.float16],
+) -> npt.NDArray[np.float16]:
+    scale = d.reshape(*d.shape, 1) * sc
+    minimum = dmin.reshape(*d.shape, 1) * m
+    x = scale.reshape(*scale.shape, 1) * qs - minimum.reshape(*minimum.shape, 1)
+    return x
+
+def pack_q2_k(
+    qs: npt.NDArray[np.uint8],
+    sc: npt.NDArray[np.uint8],
+    m: npt.NDArray[np.uint8],
+    d: npt.NDArray[np.float16],
+    dmin: npt.NDArray[np.float16],
+) -> npt.NDArray[np.uint8]:
+    num_blocks = d.shape[0]
+    assert qs.shape == (num_blocks, 16, 16)
+    assert sc.shape == (num_blocks, 16)
+    assert m.shape == (num_blocks, 16)
+    assert d.shape == (num_blocks,)
+    assert dmin.shape == (num_blocks,)
+    blocks = np.empty((num_blocks,), _q2_k_dtype())
+
+    blocks['d'][:] = d
+    blocks['dmin'][:] = dmin
+    blocks['scales'][:, :] = sc
+    blocks['scales'][:, :] |= m << 4
+
+    qs = qs.reshape(num_blocks, QK_K)
+
+    ql, qh = _pack_k_qs(
+        qs,
+        num_low_bits = 2,
+        num_low_sub_blocks = 2,
+    )
+    assert qh is None
+
+    blocks['qs'][:] = ql
+
+    return blocks.view(np.uint8)
+
+def test_unpack_q2_k(
+    data: npt.NDArray[np.uint8],
+) -> Tuple[
+    npt.NDArray[np.uint8],
+    npt.NDArray[np.uint8],
+    npt.NDArray[np.uint8],
+    npt.NDArray[np.float16],
+    npt.NDArray[np.float16],
+]:
+    qs, sc, m, d, dmin = unpack_q2_k(data)
+
+    data2 = pack_q2_k(qs, sc, m, d, dmin)
+
+    if (data2 != data).any():
+        blocks = data.view(_q2_k_dtype())
+        blocks2 = data2.view(_q2_k_dtype())
+        if (blocks2['d'] != blocks['d']).any():
+            print('d mismatch')
+        if (blocks2['dmin'] != blocks['dmin']).any():
+            print('dmin mismatch')
+        if (blocks2['scales'] != blocks['scales']).any():
+            print('scales mismatch')
+        if (blocks2['qs'] != blocks['qs']).any():
+            print('qs mismatch')
+        assert False, 'bug in pack/unpack_q2_k'
+
+    return qs, sc, m, d, dmin

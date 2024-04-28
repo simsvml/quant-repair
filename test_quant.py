@@ -169,6 +169,22 @@ def run():
                 '%s_quant.k_scales' % tensor.name: torch.from_numpy(scales),
                 '%s_quant.k_d' % tensor.name: torch.from_numpy(d),
             })
+        elif quant == GGMLQuantizationType.Q2_K:
+            qs, sc, m, d, dmin = gguf_quant.test_unpack_q2_k(tensor.data)
+
+            if not tensor.name.startswith('blk.'):
+                # `quantized.replace_modules` doesn't yet support these.
+                data = gguf_quant.dequant_q2_k(qs, sc, m, d, dmin)
+                state_dict[tensor.name] = torch.from_numpy(data).view(*shape)
+                continue
+
+            state_dict.update({
+                '%s_quant.k_qs' % tensor.name: torch.from_numpy(qs),
+                '%s_quant.k_sc' % tensor.name: torch.from_numpy(sc),
+                '%s_quant.k_m' % tensor.name: torch.from_numpy(m),
+                '%s_quant.k_d' % tensor.name: torch.from_numpy(d),
+                '%s_quant.k_dmin' % tensor.name: torch.from_numpy(dmin),
+            })
         else:
             raise AssertionError('quant %s not implemented for tensor %s' % (
                 quant, tensor.name))
