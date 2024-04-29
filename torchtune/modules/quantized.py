@@ -15,17 +15,59 @@ def round_ste(t: Tensor) -> Tensor:
     return t + (t.round() - t).detach()
 
 QS_BOUNDS = {
+        # KSimple
+        GGMLQuantizationType.Q3_K: (-4, 3),
         GGMLQuantizationType.Q6_K: (-32, 31),
+
+        # KWithMin
+        GGMLQuantizationType.Q2_K: (0, 3),
+        GGMLQuantizationType.Q4_K: (0, 15),
+        GGMLQuantizationType.Q5_K: (0, 31),
         }
 
 SCALES_BOUNDS = {
+        # KSimple
+        GGMLQuantizationType.Q3_K: (-32, 31),
         GGMLQuantizationType.Q6_K: (-128, 127),
+
+        # KWithMin
+        GGMLQuantizationType.Q2_K: (0, 15),
+        GGMLQuantizationType.Q4_K: (0, 63),
+        GGMLQuantizationType.Q5_K: (0, 63),
         }
 
-class QuantizedTensor(nn.Module):
+SUB_BLOCK_SHAPE = {
+        # KSimple
+        GGMLQuantizationType.Q3_K: (16, 16),
+        GGMLQuantizationType.Q6_K: (16, 16),
+
+        # KWithMin
+        GGMLQuantizationType.Q2_K: (16, 16),
+        GGMLQuantizationType.Q4_K: (8, 32),
+        GGMLQuantizationType.Q5_K: (8, 32),
+        }
+
+# `dtype` to use for latent weights of various quant formats.
+#
+# TODO: Figure out whether bf16, fp16, or fp32 is best for the latent weights
+# backing integer values.  I suspect we need high precision in the mantissa
+# because we may need to accumulate many small updates into the latent weight
+# before the integer value changes.  bf16 only has 8 bits of mantissa
+# precision, so small updates applied to large values would be lost.
+QUANTIZED_DTYPE = {
+        # TODO: Could probably use bfloat16 for some of the smaller quants
+        # TODO: Separate dtypes for `qs` and `scales`?
+        GGMLQuantizationType.Q2_K: torch.float32,
+        GGMLQuantizationType.Q3_K: torch.float32,
+        GGMLQuantizationType.Q4_K: torch.float32,
+        GGMLQuantizationType.Q5_K: torch.float32,
+        GGMLQuantizationType.Q6_K: torch.float32,
+        }
+
+class QuantizedTensor_KSimple(nn.Module):
     """
     Zero-argument module that just reconstructs a tensor from its quantized
-    form.
+    form.  Supports "simple" K-quant formats: `qs * scales * d`.
     """
 
     def __init__(self, shape, quant) -> None:
@@ -39,21 +81,13 @@ class QuantizedTensor(nn.Module):
         self.num_elems = num_elems
         num_blocks = num_elems // QK_K
 
-        # TODO: Figure out whether bf16, fp16, or fp32 is best for the latent
-        # weights backing integer values.  I suspect we need high precision in
-        # the mantissa because we may need to accumulate many small updates
-        # into the latent weight before the integer value changes.  bf16 only
-        # has 8 bits of mantissa precision, so small updates applied to large
-        # values would be lost.
-        quant_dtype = torch.float32
-        #quant_dtype = torch.float16
-        #quant_dtype = torch.bfloat16
+        quant_dtype = QUANTIZED_DTYPE[self.quant]
+        sub_blocks, elems = SUB_BLOCK_SHAPE[self.quant]
 
-        # TODO: 16x16 is used for Q6_K; might need to vary this for other modes
         self.k_qs = nn.Parameter(
-                torch.empty((num_blocks, 16, 16), dtype=quant_dtype))
+                torch.empty((num_blocks, sub_blocks, elems), dtype=quant_dtype))
         self.k_scales = nn.Parameter(
-                torch.empty((num_blocks, 16), dtype=quant_dtype))
+                torch.empty((num_blocks, sub_blocks), dtype=quant_dtype))
         self.k_d = nn.Parameter(torch.empty((num_blocks,)))
 
         self.output_dtype = torch.get_default_dtype()
@@ -63,14 +97,86 @@ class QuantizedTensor(nn.Module):
         return GGMLQuantizationType(self._quant)
 
     def forward(self) -> Tensor:
+        #assert not torch.isnan(self.k_qs).any(), 'got nan in INPUT qs'
+        #assert not torch.isnan(self.k_scales).any(), 'got nan in INPUT scales'
+        #assert not torch.isnan(self.k_d).any(), 'got nan in INPUT d'
         qs = round_ste(self.k_qs).clamp(*QS_BOUNDS[self.quant])
         #assert not torch.isnan(qs).any(), 'got nan in qs'
         scales = round_ste(self.k_scales).clamp(*SCALES_BOUNDS[self.quant])
         #assert not torch.isnan(scales).any(), 'got nan in scales'
-        #assert not torch.isnan(self.k_d).any(), 'got nan in d'
         xs = (self.k_d.unsqueeze(1) * scales).unsqueeze(2) * qs
         #assert not torch.isnan(xs).any(), 'got nan in xs'
         return xs.view(-1)[:self.num_elems].view(self.shape).to(self.output_dtype)
+
+class QuantizedTensor_KWithMin(nn.Module):
+    """
+    Zero-argument module that just reconstructs a tensor from its quantized
+    form.  Supports K-quant formats with a minimum: `qs * sc * d - m * dmin`.
+    """
+
+    def __init__(self, shape, quant) -> None:
+        super().__init__()
+        self.shape = shape
+        self._quant = int(quant)
+
+        num_elems = 1
+        for d in shape:
+            num_elems *= d
+        self.num_elems = num_elems
+        num_blocks = num_elems // QK_K
+
+        quant_dtype = QUANTIZED_DTYPE[self.quant]
+        sub_blocks, elems = SUB_BLOCK_SHAPE[self.quant]
+
+        self.k_qs = nn.Parameter(
+                torch.empty((num_blocks, sub_blocks, elems), dtype=quant_dtype))
+        self.k_sc = nn.Parameter(
+                torch.empty((num_blocks, sub_blocks), dtype=quant_dtype))
+        self.k_m = nn.Parameter(
+                torch.empty((num_blocks, sub_blocks), dtype=quant_dtype))
+        self.k_d = nn.Parameter(torch.empty((num_blocks,)))
+        self.k_dmin = nn.Parameter(torch.empty((num_blocks,)))
+
+        self.output_dtype = torch.get_default_dtype()
+
+    @property
+    def quant(self) -> GGMLQuantizationType:
+        return GGMLQuantizationType(self._quant)
+
+    def forward(self) -> Tensor:
+        #assert not torch.isnan(self.k_qs).any(), 'got nan in INPUT qs'
+        #assert not torch.isnan(self.k_sc).any(), 'got nan in INPUT sc'
+        #assert not torch.isnan(self.k_m).any(), 'got nan in INPUT m'
+        #assert not torch.isnan(self.k_d).any(), 'got nan in INPUT d'
+        #assert not torch.isnan(self.k_dmin).any(), 'got nan in INPUT dmin'
+        qs = round_ste(self.k_qs).clamp(*QS_BOUNDS[self.quant])
+        #assert not torch.isnan(qs).any(), 'got nan in qs'
+        sc = round_ste(self.k_sc).clamp(*SCALES_BOUNDS[self.quant])
+        #assert not torch.isnan(sc).any(), 'got nan in sc'
+        scale = self.k_d.unsqueeze(1) * sc
+        #assert not torch.isnan(scale).any(), 'got nan in scale'
+        m = round_ste(self.k_m).clamp(*SCALES_BOUNDS[self.quant])
+        #assert not torch.isnan(m).any(), 'got nan in m'
+        minimum = self.k_dmin.unsqueeze(1) * m
+        #assert not torch.isnan(minimum).any(), 'got nan in minimum'
+        xs = scale.unsqueeze(2) * qs - minimum.unsqueeze(2)
+        #assert not torch.isnan(xs).any(), 'got nan in xs'
+        ys = xs.view(-1)[:self.num_elems].view(self.shape).to(self.output_dtype)
+        #assert not torch.isnan(ys).any(), 'got nan in ys'
+        return xs.view(-1)[:self.num_elems].view(self.shape).to(self.output_dtype)
+
+QUANTIZED_TENSOR_TYPE = {
+        GGMLQuantizationType.Q3_K: QuantizedTensor_KSimple,
+        GGMLQuantizationType.Q6_K: QuantizedTensor_KSimple,
+
+        GGMLQuantizationType.Q2_K: QuantizedTensor_KWithMin,
+        GGMLQuantizationType.Q4_K: QuantizedTensor_KWithMin,
+        GGMLQuantizationType.Q5_K: QuantizedTensor_KWithMin,
+        }
+
+def make_quantized_tensor(shape, quant):
+    type_ = QUANTIZED_TENSOR_TYPE[quant]
+    return type_(shape, quant)
 
 class QuantLinear(nn.Module):
     """
@@ -83,9 +189,9 @@ class QuantLinear(nn.Module):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.weight_quant = QuantizedTensor((out_features, in_features), weight_quant)
+        self.weight_quant = make_quantized_tensor((out_features, in_features), weight_quant)
         if bias:
-            self.bias_quant = QuantizedTensor((out_features,), bias_quant)
+            self.bias_quant = make_quantized_tensor((out_features,), bias_quant)
         else:
             self.register_parameter('bias_quant', None)
 
