@@ -32,6 +32,7 @@ from torchtune.utils import gguf_quant
 from torchtune.utils import padded_collate
 import safetensors.torch
 from tqdm import tqdm
+from quant_repair.forward import SuperbatchEmbeddings, sized_chunks
 
 
 LAYER_PARAMETERS = {
@@ -273,14 +274,6 @@ def run():
     max_samples = gradient_accumulation_steps * max_steps_per_epoch
 
     superbatch_mem_gb = 32
-    # When processing a superbatch, we have two output tensors, each containing
-    # one embedding per token.
-    superbatch_bytes_per_token = 2 * arch.embed_dim * torch.get_default_dtype().itemsize
-    superbatch_tokens = superbatch_mem_gb * 1024 ** 3 // superbatch_bytes_per_token
-    # Number of batches/samples per superbatch
-    superbatch_size = superbatch_tokens // (max_seq_len * batch_size)
-    print('forward pass superbatch contains %d batches, %d tokens' %
-          (superbatch_size, superbatch_tokens))
 
 
     # Set up dataset and loader
@@ -314,7 +307,7 @@ def run():
         train_module.parameters(),
         #lr = 1e-6 * math.sqrt(1 + train_layer_index),
         # Changed after layer 9
-        lr = 2e-6 * math.sqrt(1 + train_layer_index),
+        lr = 1e-6 * math.sqrt(1 + train_layer_index),
     )
     lr_scheduler = lr_schedulers.get_exponential_schedule(
         optimizer,
@@ -342,69 +335,57 @@ def run():
         # in case shuffle is True
         sampler.set_epoch(curr_epoch)
 
-        samples_iter = iter(pbar := tqdm(dataloader, total=max_samples, desc='samples',
-            position=0, leave=True))
+        samples_iter = (tokens for tokens, labels in dataloader)
+        samples_iter = itertools.islice(samples_iter, max_samples)
+        samples_iter = iter(pbar := tqdm(samples_iter,
+            total=max_samples, desc='samples', position=0, leave=True))
         samples_processed = 0
 
-        for superbatch_start in range(0, max_samples, superbatch_size):
-            superbatch_end = min(superbatch_start + superbatch_size, max_samples)
-            superbatch_current_size = superbatch_end - superbatch_start
-            samples = [tokens for tokens, labels in
-                itertools.islice(samples_iter, superbatch_current_size)]
+        embeds_orig = SuperbatchEmbeddings(arch, ram_gb=superbatch_mem_gb // 2)
+        embeds_quant = SuperbatchEmbeddings(arch, ram_gb=superbatch_mem_gb // 2)
+        superbatch_limit = embeds_orig.tokens_free()
 
-            # Run prompt processing on the samples, collecting the embeddings
-            # from the original and quantized model in CPU buffers.
-            embeds_shape = (
-                superbatch_current_size,
-                batch_size,
-                max_seq_len,
-                arch.embed_dim,
-            )
-            embeds_orig = torch.empty(embeds_shape, device='cpu')
-            embeds_quant = torch.empty(embeds_shape, device='cpu')
+        for superbatch_samples in sized_chunks(samples_iter, superbatch_limit,
+                lambda t: t.numel()):
+            embeds_orig.clear()
+            embeds_quant.clear()
 
             orig_infos = orig_layer_info[:1 + train_layer_index + 1]
             orig_infos_iter = tqdm(orig_infos, desc='orig layers', position=1, leave=False)
             quant_infos = quant_layer_info[:1 + train_layer_index]
             quant_infos_iter = tqdm(quant_infos, desc='quant layers', position=2, leave=False)
+            superbatch_tqdm_kwargs = dict(desc='superbatch', position=3, leave=False)
 
             with record_time(metrics, 'orig_time'):
                 for info in orig_infos_iter:
                     (kind, _), _ = info
                     m = orig_layer_module(info)
-                    for i in tqdm(range(superbatch_current_size), desc='superbatch',
-                            position=3, leave=False):
-                        _, seq_len = samples[i].shape
-                        if kind == 'tok_embeddings':
-                            x = samples[i].to(device)
-                        else:
-                            x = embeds_orig[i, :, 0:seq_len, :].to(device)
-                        y = m(x)
-                        embeds_orig[i, :, 0:seq_len, :] = y
+                    if kind == 'tok_embeddings':
+                        for sample in tqdm(superbatch_samples, **superbatch_tqdm_kwargs):
+                            y = m(sample.to(device))
+                            embeds_orig.append(y)
+                    else:
+                        embeds_orig.apply(m, device=device, tqdm_kwargs=superbatch_tqdm_kwargs)
 
             with record_time(metrics, 'quant_time'):
                 for info in quant_infos_iter:
                     (kind, _), _ = info
                     m = quant_layer_module(info)
-                    for i in tqdm(range(superbatch_current_size), desc='superbatch',
-                            position=3, leave=False):
-                        _, seq_len = samples[i].shape
-                        if kind == 'tok_embeddings':
-                            x = samples[i].to(device)
-                        else:
-                            x = embeds_quant[i, :, 0:seq_len, :].to(device)
-                        y = m(x)
-                        embeds_quant[i, :, 0:seq_len, :] = y
+                    if kind == 'tok_embeddings':
+                        for sample in tqdm(superbatch_samples, **superbatch_tqdm_kwargs):
+                            y = m(sample.to(device))
+                            embeds_quant.append(y)
+                    else:
+                        embeds_quant.apply(m, device=device, tqdm_kwargs=superbatch_tqdm_kwargs)
 
 
             # Train using the collected embeddings.
 
             with record_time(metrics, 'train_time'):
-                for i in tqdm(range(superbatch_current_size), desc='train',
+                for i in tqdm(range(len(superbatch_samples)), desc='train',
                         position=3, leave=False):
-                    _, seq_len = samples[i].shape
-                    quant_input = embeds_quant[i, :, 0:seq_len, :].to(device)
-                    orig_output = embeds_orig[i, :, 0:seq_len, :].to(device)
+                    quant_input = embeds_quant[i].to(device)
+                    orig_output = embeds_orig[i].to(device)
                     train_output = train_module(quant_input)
 
                     loss = loss_fn(train_output, orig_output)
