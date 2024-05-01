@@ -7,6 +7,7 @@ from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
+import itertools
 import json
 import math
 import os
@@ -122,11 +123,16 @@ def run():
 
     # These two lists store `(key, weights_desc)` pairs for use with the
     # `ModuleCache`.  For `key`, we use `(kind, fmt)` as expected by
-    # `Llama3Arch.make_module`, where `fmt` is the layer's `quant_map` sorted
-    # and flattened into a tuple.  (For the original model, all the quant modes
-    # are `F16`.)  For `weights_desc`, `orig_layer_info` has a parameter name
+    # `Llama3Arch.make_module`.  All quant modes in `fmt` are always `F16`,
+    # since we dequantize weights when loaded to improve performance of the
+    # forward pass.  For `weights_desc`, `orig_layer_info` has a parameter name
     # prefix for looking up in `orig_state_dict`, and `quant_layer_info` has
-    # the filename from `quant_module_files` where the weights can be read.
+    # the filename from `quant_module_files` where the weights can be read
+    # along with the quantized format (used to load and process the quantized
+    # weights).
+    #
+    # Note that the two lists use the same `key`s, so they must use distinct
+    # sets of `weights_desc`s to avoid collisions within the cache.
     orig_layer_info = []
     quant_layer_info = []
     def add_layer_info(kind, param_names, param_name_prefix=None, quant_name=None):
@@ -135,17 +141,16 @@ def run():
         if quant_name is None:
             quant_name = kind
 
-        layer_quant_map = {name: quant_map[param_name_prefix + name] for name in param_names}
-        quant_fmt = tuple(sorted(layer_quant_map.items()))
-        quant_key = (kind, quant_fmt)
-        quant_file_name, _ = quant_module_files[quant_name]
-
         orig_layer_quant_map = {name: GGMLQuantizationType.F16 for name in param_names}
         orig_fmt = tuple(sorted(orig_layer_quant_map.items()))
-        orig_key = (kind, orig_fmt)
+        key = (kind, orig_fmt)
 
-        orig_layer_info.append((orig_key, param_name_prefix))
-        quant_layer_info.append((quant_key, quant_file_name))
+        layer_quant_map = {name: quant_map[param_name_prefix + name] for name in param_names}
+        quant_fmt = tuple(sorted(layer_quant_map.items()))
+        quant_file_name, _ = quant_module_files[quant_name]
+
+        orig_layer_info.append((key, param_name_prefix))
+        quant_layer_info.append((key, (quant_file_name, quant_fmt)))
     add_layer_info('tok_embeddings', ('weight',))
     for i in range(arch.num_layers):
         add_layer_info(
@@ -160,7 +165,7 @@ def run():
     print('quantized module files:')
     for info in quant_layer_info:
         key, weights_desc = info
-        quant_file_name = weights_desc
+        quant_file_name, quant_fmt = weights_desc
         print('  ' + quant_file_name)
 
 
@@ -191,9 +196,40 @@ def run():
             x = m(x)
         return x
 
-    def quant_module_state_dict(key, weights_desc):
+    def load_quantized_state_dict(key, weights_desc):
         quant_file_name = weights_desc
         return torch.load(os.path.join(quant_dir, quant_file_name))
+
+    def load_quantized_module(kind, quant_fmt, quant_file_name):
+        return module_cache.get_module(
+            (kind, quant_fmt),
+            quant_file_name,
+            lambda key: arch.make_module(key).requires_grad_(False).to(device),
+            load_quantized_state_dict,
+        )
+
+    def quant_module_state_dict(key, weights_desc):
+        kind, fmt = key
+        quant_file_name, quant_fmt = weights_desc
+        if all(quant in quantized.UNQUANTIZED_TYPES for _, quant in quant_fmt):
+            # For modules that are already unquantized, just load the weights.
+            return load_quantized_state_dict(key, quant_file_name)
+
+        # Load the quantized version of the module, then dequantize it.
+        quant_module = load_quantized_module(kind, quant_fmt, quant_file_name)
+
+        state_dict = {name: None for name, _ in fmt}
+        for name, param in quant_module.named_parameters():
+            if name not in state_dict:
+                continue
+            state_dict[name] = param
+        for name, value in state_dict.items():
+            if value is not None:
+                continue
+            state_dict[name] = quant_module.get_submodule(name + '_quant').forward()
+        assert not any(v is None for v in state_dict.values()), \
+                'missing parameters: %s' % [k for k,v in state_dict.items() if v is None]
+        return state_dict
 
     def quant_layer_module(info) -> nn.Module:
         key, weights_desc = info
@@ -212,10 +248,17 @@ def run():
 
 
     # Build trainable layer
-    train_key, train_weights_desc = quant_layer_info[1 + train_layer_index]
-    train_module = arch.make_module(train_key).to(device)
-    train_module.load_state_dict(quant_module_state_dict(train_key, train_weights_desc))
-    train_module.requires_grad_(True)
+    def build_train_module():
+        key, weights_desc = quant_layer_info[1 + train_layer_index]
+        kind, fmt = key
+        quant_file_name, quant_fmt = weights_desc
+        quant_key = (kind, quant_fmt)
+        m = arch.make_module(quant_key).to(device)
+        m.load_state_dict(load_quantized_state_dict(quant_key, quant_file_name))
+        m.requires_grad_(True)
+        return m
+
+    train_module = build_train_module()
 
     train_checkpoint_index = quant_module_files['layer%d' % train_layer_index][1]
 
@@ -225,16 +268,19 @@ def run():
     batch_size = 8
     total_epochs = 1
     max_steps_per_epoch = 100
-    gradient_accumulation_steps = 16
+    gradient_accumulation_steps = 8
 
-#    TODO
-#    superbatch_mem_gb = 2
-#    # When processing a superbatch, we have two output tensors and one
-#    # temporary tensor, each containing one embedding per token.
-#    superbatch_bytes_per_token = 3 * arch.embed_dim * torch.get_default_dtype().itemsize
-#    superbatch_tokens = superbatch_mem_gb * 1024 ** 3 // superbatch_bytes_per_token
-#    superbatch_size = superbatch_tokens // max_seq_len
-#    print('forward pass superbatch size: %d' % superbatch_size)
+    max_samples = gradient_accumulation_steps * max_steps_per_epoch
+
+    superbatch_mem_gb = 32
+    # When processing a superbatch, we have two output tensors, each containing
+    # one embedding per token.
+    superbatch_bytes_per_token = 2 * arch.embed_dim * torch.get_default_dtype().itemsize
+    superbatch_tokens = superbatch_mem_gb * 1024 ** 3 // superbatch_bytes_per_token
+    # Number of batches/samples per superbatch
+    superbatch_size = superbatch_tokens // (max_seq_len * batch_size)
+    print('forward pass superbatch contains %d batches, %d tokens' %
+          (superbatch_size, superbatch_tokens))
 
 
     # Set up dataset and loader
@@ -266,7 +312,9 @@ def run():
     # Optimizer, learning rate schedule, and loss function
     optimizer = torch.optim.AdamW(
         train_module.parameters(),
-        lr = 1e-6 * math.sqrt(1 + train_layer_index),
+        #lr = 1e-6 * math.sqrt(1 + train_layer_index),
+        # Changed after layer 9
+        lr = 2e-6 * math.sqrt(1 + train_layer_index),
     )
     lr_scheduler = lr_schedulers.get_exponential_schedule(
         optimizer,
@@ -294,45 +342,92 @@ def run():
         # in case shuffle is True
         sampler.set_epoch(curr_epoch)
 
-        max_samples = gradient_accumulation_steps * max_steps_per_epoch
-        for idx, batch in enumerate(pbar := tqdm(dataloader, total=max_samples)):
-            if (
-                max_steps_per_epoch is not None
-                and (idx // gradient_accumulation_steps) == max_steps_per_epoch
-            ):
-                break
+        samples_iter = iter(pbar := tqdm(dataloader, total=max_samples, desc='samples',
+            position=0, leave=True))
+        samples_processed = 0
 
-            input_ids, labels = batch
-            input_ids = input_ids.to(device)
+        for superbatch_start in range(0, max_samples, superbatch_size):
+            superbatch_end = min(superbatch_start + superbatch_size, max_samples)
+            superbatch_current_size = superbatch_end - superbatch_start
+            samples = [tokens for tokens, labels in
+                itertools.islice(samples_iter, superbatch_current_size)]
+
+            # Run prompt processing on the samples, collecting the embeddings
+            # from the original and quantized model in CPU buffers.
+            embeds_shape = (
+                superbatch_current_size,
+                batch_size,
+                max_seq_len,
+                arch.embed_dim,
+            )
+            embeds_orig = torch.empty(embeds_shape, device='cpu')
+            embeds_quant = torch.empty(embeds_shape, device='cpu')
+
+            orig_infos = orig_layer_info[:1 + train_layer_index + 1]
+            orig_infos_iter = tqdm(orig_infos, desc='orig layers', position=1, leave=False)
+            quant_infos = quant_layer_info[:1 + train_layer_index]
+            quant_infos_iter = tqdm(quant_infos, desc='quant layers', position=2, leave=False)
+
+            with record_time(metrics, 'orig_time'):
+                for info in orig_infos_iter:
+                    (kind, _), _ = info
+                    m = orig_layer_module(info)
+                    for i in tqdm(range(superbatch_current_size), desc='superbatch',
+                            position=3, leave=False):
+                        _, seq_len = samples[i].shape
+                        if kind == 'tok_embeddings':
+                            x = samples[i].to(device)
+                        else:
+                            x = embeds_orig[i, :, 0:seq_len, :].to(device)
+                        y = m(x)
+                        embeds_orig[i, :, 0:seq_len, :] = y
 
             with record_time(metrics, 'quant_time'):
-                quant_input = run_quant(1 + train_layer_index, input_ids)
-            with record_time(metrics, 'orig_time'):
-                orig_output = run_orig(1 + train_layer_index + 1, input_ids)
+                for info in quant_infos_iter:
+                    (kind, _), _ = info
+                    m = quant_layer_module(info)
+                    for i in tqdm(range(superbatch_current_size), desc='superbatch',
+                            position=3, leave=False):
+                        _, seq_len = samples[i].shape
+                        if kind == 'tok_embeddings':
+                            x = samples[i].to(device)
+                        else:
+                            x = embeds_quant[i, :, 0:seq_len, :].to(device)
+                        y = m(x)
+                        embeds_quant[i, :, 0:seq_len, :] = y
+
+
+            # Train using the collected embeddings.
 
             with record_time(metrics, 'train_time'):
-                train_output = train_module(quant_input)
+                for i in tqdm(range(superbatch_current_size), desc='train',
+                        position=3, leave=False):
+                    _, seq_len = samples[i].shape
+                    quant_input = embeds_quant[i, :, 0:seq_len, :].to(device)
+                    orig_output = embeds_orig[i, :, 0:seq_len, :].to(device)
+                    train_output = train_module(quant_input)
 
-                loss = loss_fn(train_output, orig_output)
-                loss = loss / gradient_accumulation_steps
-                loss.backward()
+                    loss = loss_fn(train_output, orig_output)
+                    loss = loss / gradient_accumulation_steps
+                    loss.backward()
 
-            pbar.set_description(
-                f"{curr_epoch+1}|{idx+1}|Loss: {loss.item():.6e}"
-            )
+                    samples_processed += 1
+                    if samples_processed % gradient_accumulation_steps == 0:
+                        with record_time(metrics, 'opt_time'):
+                            optimizer.step()
+                            optimizer.zero_grad(set_to_none=True)
+                            lr_scheduler.step()
 
-            if (idx + 1) % gradient_accumulation_steps == 0:
-                with record_time(metrics, 'opt_time'):
-                    optimizer.step()
-                    optimizer.zero_grad(set_to_none=True)
-                    lr_scheduler.step()
+                    pbar.set_description(
+                        f"{curr_epoch+1}|{samples_processed}|Loss: {loss.item():.6e}"
+                    )
 
-            metrics['loss'] = loss.item()
-            metrics['lr'] = optimizer.param_groups[0]["lr"]
-            metrics['gpu_resources'] = torch.cuda.memory_allocated()
-            json.dump(metrics, log_file)
-            log_file.write('\n')
-            log_file.flush()
+                    metrics['loss'] = loss.item()
+                    metrics['lr'] = optimizer.param_groups[0]["lr"]
+                    metrics['gpu_resources'] = torch.cuda.memory_allocated()
+                    json.dump(metrics, log_file)
+                    log_file.write('\n')
+                    log_file.flush()
 
         train_checkpoint_index += 1
         state_dict = train_module.state_dict()
@@ -341,85 +436,10 @@ def run():
         if os.path.exists(checkpoint_path):
             old_checkpoint_path = '%s.old.%d' % (checkpoint_path, time.time())
             os.rename(checkpoint_path, old_checkpoint_path)
-            print('renamed %s -> %s to avoid overwrite' % (checkpoint_path, old_checkpoint_path))
+            tqdm.write('renamed %s -> %s to avoid overwrite' %
+                (checkpoint_path, old_checkpoint_path))
         torch.save(state_dict, checkpoint_path)
-        print('saved %s' % checkpoint_path)
-
-    return
-
-
-
-    quant_reader = GGUFReader(gguf_path)
-
-
-    # Build the list of layer keys.
-    quant_map = {tensor.name: tensor.tensor_type for tensor in reader.tensors}
-    quant_map = convert_weights.gguf_to_tune(quant_map)
-
-    # `layer_info` stores `(key, weights_desc)` pairs for use with the
-    # `ModuleCache`.  For `key`, we use `(kind, fmt)` as expected by
-    # `Llama3Arch.make_module`, where `fmt` is the layer's `quant_map` sorted
-    # and flattened into a tuple.  For `weights_desc`, we store the string that
-    # should be prefixed to the parameter names in `fmt` to get the names of
-    # the weights to read from the model file.
-    layer_info = []
-    def add_layer_info(kind, param_names, weights_desc=None):
-        if weights_desc is None:
-            weights_desc = kind + '.'
-        layer_quant_map = {name: quant_map[weights_desc + name] for name in param_names}
-        fmt = tuple(sorted(layer_quant_map.items()))
-        key = (kind, fmt)
-        layer_info.append((key, weights_desc))
-    add_layer_info('tok_embeddings', ('weight',))
-    for i in range(arch.num_layers):
-        add_layer_info('layer', LAYER_PARAMETERS, 'layers.%d.' % i)
-    add_layer_info('norm', ('scale',))
-    add_layer_info('output', ('weight',))
-
-    pprint(layer_info)
-
-
-    # Helpers for obtaining module layers
-    module_cache = ModuleCache()
-
-    def get_state_dict(key, weights_desc):
-        kind, fmt = key
-        # After conversion, this will map the full name as used in the GGUF to
-        # the short name (scoped to the current layer) expected in the output.
-        layer_name_map = convert_weights.tune_to_gguf(
-            dict((weights_desc + name, name) for name, quant in fmt))
-        state_dict = {}
-        for gguf_name, tune_name in layer_name_map.items():
-            state_dict.update(gguf_load_tensor_unpacked(reader, gguf_name, tune_name))
-        print('state dict keys for %s, %s = %s' % (key, weights_desc, list(state_dict.keys())))
-        return state_dict
-
-    def layer_module(info) -> nn.Module:
-        key, weights_desc = info
-        return module_cache.get_module(
-            key,
-            weights_desc,
-            lambda key: arch.make_module(key).to(device),
-            get_state_dict,
-        )
-
-    #print('loading', layer_info[3])
-    #m = layer_module(layer_info[3])
-
-    print('test run')
-    tokens = tokenizer.encode('Hello, my name is', add_eos=False)
-    print(tokens)
-
-    x = torch.tensor([tokens], device=device, dtype=torch.int)
-    for info in layer_info:
-        print('\nrunning %s' % (info,))
-        m = layer_module(info)
-        x = m(x)
-
-    print('\ndone')
-    print(x[0, -1])
-    print(top_tokens(tokenizer, x[0, -2], top_k=10))
-    print(top_tokens(tokenizer, x[0, -1], top_k=10))
+        tqdm.write('saved %s' % checkpoint_path)
 
 
 if __name__ == '__main__':
