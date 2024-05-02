@@ -4,7 +4,6 @@ Measure error introduced at each layer by quantization.
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
-from functools import partial
 import itertools
 import json
 import math
@@ -25,14 +24,13 @@ from torchtune.models.llama3 import llama3_8b, llama3_tokenizer_transformers
 from torchtune.modules import quantized, lr_schedulers
 from torchtune.modules.module_cache import ModuleCache, Llama3Arch
 from torchtune.modules.tokenizers import Tokenizer
-from torchtune.datasets import slimorca_dataset
 from torchtune.utils import FullModelGGUFCheckpointer, set_default_dtype
 from gguf import GGUFReader, GGMLQuantizationType
 from torchtune.utils import gguf_quant
-from torchtune.utils import padded_collate
 import safetensors.torch
 from tqdm import tqdm
 from quant_repair.forward import SuperbatchEmbeddings, sized_chunks
+from quant_repair.datasets import load_slimorca_dataset
 
 
 LAYER_PARAMETERS = {
@@ -61,38 +59,6 @@ def top_tokens(tokenizer, logits, top_k=3, temperature=1.0):
     return [(prob.item(), tokenizer.decode(token)) for prob, token in zip(top_k_probs, top_k_indices)]
 
 
-
-
-class TextDataset(Dataset):
-    def __init__(
-        self,
-        tokenizer: Tokenizer,
-        source: str,
-        max_seq_len: Optional[int] = None,
-        **load_dataset_kwargs: Dict[str, Any],
-    ) -> None:
-        self._tokenizer = tokenizer
-        self._data = load_dataset(source, **load_dataset_kwargs)
-        self.max_seq_len = max_seq_len
-
-    def __len__(self):
-        return len(self._data)
-
-    def __getitem__(self, index: int) -> Tuple[List[int], List[int]]:
-        sample = self._data[index]
-        return self._prepare_sample(sample)
-
-    def _prepare_sample(self, sample: Mapping[str, Any]) -> Tuple[List[int], List[int]]:
-        tokens = self._tokenizer.encode(sample['text'], add_bos=True, add_eos=False)
-        if len(tokens) > self.max_seq_len:
-            tokens = tokens[:self.max_seq_len]
-
-        # Wherever mask == True, set to CROSS_ENTROPY_IGNORE_IDX. Otherwise keep as tokens
-        #labels = list(np.where(mask, CROSS_ENTROPY_IGNORE_IDX, tokens))
-        #assert len(tokens) == len(labels)
-        labels = tokens
-
-        return tokens, labels
 
 
 @contextmanager
@@ -238,8 +204,8 @@ def run():
     max_seq_len = 1024
     batch_size = 8
     total_epochs = 1
-    max_steps_per_epoch = 1
-    gradient_accumulation_steps = 1
+    max_steps_per_epoch = 20
+    gradient_accumulation_steps = 8
 
     max_samples = gradient_accumulation_steps * max_steps_per_epoch
 
@@ -247,35 +213,12 @@ def run():
 
 
     # Set up dataset and loader
-    dataset = slimorca_dataset(
+    sampler, dataloader = load_slimorca_dataset(
         tokenizer=tokenizer,
         max_seq_len=max_seq_len,
         train_on_input=True,
-    )
-#    dataset = TextDataset(
-#        tokenizer=tokenizer,
-#        max_seq_len=max_seq_len,
-#        source='wikitext',
-#        name='wikitext-2-raw-v1',
-#        split='test',
-#    )
-    sampler = DistributedSampler(
-        dataset,
-        num_replicas=1,
-        rank=0,
-        shuffle=True,
-        seed=0,
-    )
-    dataloader = DataLoader(
-        dataset=dataset,
-        sampler=sampler,
+        seed=12345,
         batch_size=batch_size,
-        collate_fn=partial(
-            padded_collate,
-            padding_idx=tokenizer.pad_id,
-            #ignore_idx=loss_fn.ignore_index,
-            ignore_idx=-100,
-        ),
     )
 
 
