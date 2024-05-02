@@ -150,6 +150,16 @@ def main():
     quant_map = {tensor.name: tensor.tensor_type for tensor in reader.tensors}
     quant_map = convert_weights.gguf_to_tune(quant_map)
 
+    quant_shape_map = {}
+    for tensor in reader.tensors:
+        name = tensor.name
+        quant = tensor.tensor_type
+        shape_length = max((j + 1 for j, dim in enumerate(tensor.shape) if dim != 1),
+            default=len(tensor.shape))
+        shape = tuple(int(x) for x in reversed(tensor.shape[:shape_length]))
+        quant_shape_map[name] = (quant, shape)
+    quant_shape_map = convert_weights.gguf_to_tune(quant_shape_map)
+
     # Collect layers
     named_tensor_map = {tensor.name: tensor for tensor in reader.tensors}
     named_tensor_map = convert_weights.gguf_to_tune(named_tensor_map)
@@ -193,6 +203,11 @@ def main():
     print('quant map')
     output_path = os.path.join(output_dir, 'quant_map.pt')
     torch.save(quant_map, output_path)
+    print('saved %s' % output_path)
+
+    print('quant and shape map ')
+    output_path = os.path.join(output_dir, 'quant_shape_map.pt')
+    torch.save(quant_shape_map, output_path)
     print('saved %s' % output_path)
 
 

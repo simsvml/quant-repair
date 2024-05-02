@@ -259,6 +259,7 @@ def run():
         print('\nrunning %s' % (info,))
         m = layer_module(info)
         x = m(x)
+        print('layer %s: %s' % (info[1], x))
 
     print('\ndone')
     print(x[0, -1])
