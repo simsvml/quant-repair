@@ -305,14 +305,17 @@ def run():
     # Optimizer, learning rate schedule, and loss function
     optimizer = torch.optim.AdamW(
         train_module.parameters(),
-        #lr = 1e-6 * math.sqrt(1 + train_layer_index),
-        # Changed after layer 9
-        lr = 1e-6 * math.sqrt(1 + train_layer_index),
+        # Layer 0:
+        #lr = 1.5e-6 * math.sqrt(1 + train_layer_index),
+        # Layer 1:
+        #lr = 1.0e-6 * math.sqrt(1 + train_layer_index),
+        # Layers 2-31:
+        lr = 1.5e-6,
     )
     lr_scheduler = lr_schedulers.get_exponential_schedule(
         optimizer,
         start_factor = 1.0,
-        end_factor = 0.1,
+        end_factor = 0.5,
         num_training_steps = total_epochs * max_steps_per_epoch,
     )
     loss_fn = nn.MSELoss()
@@ -409,6 +412,7 @@ def run():
                     json.dump(metrics, log_file)
                     log_file.write('\n')
                     log_file.flush()
+
 
         train_checkpoint_index += 1
         state_dict = train_module.state_dict()

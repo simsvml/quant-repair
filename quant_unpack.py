@@ -5,6 +5,7 @@ import sys
 from typing import Optional, Any, Dict
 import torch
 from torch import Tensor
+from torch.nn import functional as F
 from torchtune.models import convert_weights
 from torchtune.modules import quantized
 from torchtune.utils import gguf_quant
@@ -27,6 +28,7 @@ LAYER_PARAMETERS = {
 def gguf_unpack_tensor(
     tensor: gguf.ReaderTensor,
     output_name: Optional[str] = None,
+    device = None,
 ) -> Dict[str, Tensor]:
     if output_name is None:
         output_name = tensor.name
@@ -44,6 +46,29 @@ def gguf_unpack_tensor(
 
     state_dict = {}
 
+    def conv_qs(x) -> Tensor:
+        x = torch.from_numpy(x)
+        if device is not None:
+            x = x.to(device)
+        x = x.to(quantized.QUANTIZED_DTYPE[quant])
+        latent = quantized.quantized_to_latent(x, quantized.QS_BOUNDS[quant])
+        #y = quantized.latent_to_quantized(latent, quantized.QS_BOUNDS[quant])
+        #print('roundtrip loss: %s' % (F.mse_loss(y, x),))
+        latent = latent.to('cpu')
+        return latent
+
+    def conv_scales(x) -> Tensor:
+        x = torch.from_numpy(x)
+        if device is not None:
+            x = x.to(device)
+        x = x.to(quantized.QUANTIZED_DTYPE[quant])
+        latent = quantized.quantized_to_latent(x, quantized.SCALES_BOUNDS[quant])
+        #y = quantized.latent_to_quantized(latent, quantized.SCALES_BOUNDS[quant])
+        #print('roundtrip loss: %s' % (F.mse_loss(y, x),))
+        latent = latent.to('cpu')
+        return latent
+
+
     if quant in quantized.UNQUANTIZED_TYPES:
         state_dict[output_name] = torch.from_numpy(tensor.data).view(*shape)
     elif quant == GGMLQuantizationType.Q6_K:
@@ -55,8 +80,8 @@ def gguf_unpack_tensor(
             return state_dict
 
         state_dict.update({
-            '%s_quant.k_qs' % output_name: torch.from_numpy(qs),
-            '%s_quant.k_scales' % output_name: torch.from_numpy(scales),
+            '%s_quant.k_qs' % output_name: conv_qs(qs),
+            '%s_quant.k_scales' % output_name: conv_scales(scales),
             '%s_quant.k_d' % output_name: torch.from_numpy(d),
         })
     elif quant == GGMLQuantizationType.Q5_K:
@@ -68,9 +93,9 @@ def gguf_unpack_tensor(
             return state_dict
 
         state_dict.update({
-            '%s_quant.k_qs' % output_name: torch.from_numpy(qs),
-            '%s_quant.k_sc' % output_name: torch.from_numpy(sc),
-            '%s_quant.k_m' % output_name: torch.from_numpy(m),
+            '%s_quant.k_qs' % output_name: conv_qs(qs),
+            '%s_quant.k_sc' % output_name: conv_scales(sc),
+            '%s_quant.k_m' % output_name: conv_scales(m),
             '%s_quant.k_d' % output_name: torch.from_numpy(d),
             '%s_quant.k_dmin' % output_name: torch.from_numpy(dmin),
         })
@@ -83,9 +108,9 @@ def gguf_unpack_tensor(
             return state_dict
 
         state_dict.update({
-            '%s_quant.k_qs' % output_name: torch.from_numpy(qs),
-            '%s_quant.k_sc' % output_name: torch.from_numpy(sc),
-            '%s_quant.k_m' % output_name: torch.from_numpy(m),
+            '%s_quant.k_qs' % output_name: conv_qs(qs),
+            '%s_quant.k_sc' % output_name: conv_scales(sc),
+            '%s_quant.k_m' % output_name: conv_scales(m),
             '%s_quant.k_d' % output_name: torch.from_numpy(d),
             '%s_quant.k_dmin' % output_name: torch.from_numpy(dmin),
         })
@@ -98,8 +123,8 @@ def gguf_unpack_tensor(
             return state_dict
 
         state_dict.update({
-            '%s_quant.k_qs' % output_name: torch.from_numpy(qs),
-            '%s_quant.k_scales' % output_name: torch.from_numpy(scales),
+            '%s_quant.k_qs' % output_name: conv_qs(qs),
+            '%s_quant.k_scales' % output_name: conv_scales(scales),
             '%s_quant.k_d' % output_name: torch.from_numpy(d),
         })
     elif quant == GGMLQuantizationType.Q2_K:
@@ -111,9 +136,9 @@ def gguf_unpack_tensor(
             return state_dict
 
         state_dict.update({
-            '%s_quant.k_qs' % output_name: torch.from_numpy(qs),
-            '%s_quant.k_sc' % output_name: torch.from_numpy(sc),
-            '%s_quant.k_m' % output_name: torch.from_numpy(m),
+            '%s_quant.k_qs' % output_name: conv_qs(qs),
+            '%s_quant.k_sc' % output_name: conv_scales(sc),
+            '%s_quant.k_m' % output_name: conv_scales(m),
             '%s_quant.k_d' % output_name: torch.from_numpy(d),
             '%s_quant.k_dmin' % output_name: torch.from_numpy(dmin),
         })
@@ -129,7 +154,7 @@ def gguf_unpack_tensor(
             # TODO: Convert grids and signs from index to one-hot format
             #'%s_quant.k_grids' % output_name: torch.from_numpy(grids),
             #'%s_quant.k_signs' % output_name: torch.from_numpy(signs),
-            '%s_quant.k_scales' % output_name: torch.from_numpy(scales),
+            '%s_quant.k_scales' % output_name: conv_scales(scales),
             '%s_quant.k_d' % output_name: torch.from_numpy(d),
         })
     else:
@@ -142,6 +167,9 @@ def main():
     assert len(sys.argv) == 3
     gguf_path = sys.argv[1]
     output_dir = sys.argv[2]
+
+    # Use CUDA for converting quantized weights to latent weights.
+    device = 'cuda'
 
     print('load weights from %r' % (gguf_path,))
     reader = GGUFReader(gguf_path)
@@ -181,7 +209,7 @@ def main():
         for name in tensor_names:
             tensor = named_tensor_map[name]
             short_name = '.'.join(name.split('.')[2:])
-            state_dict.update(gguf_unpack_tensor(tensor, short_name))
+            state_dict.update(gguf_unpack_tensor(tensor, short_name, device=device))
         output_path = os.path.join(output_dir, 'layer%d.pt' % layer_index)
         torch.save(state_dict, output_path)
         del state_dict
@@ -190,7 +218,7 @@ def main():
     def save_single_tensor(module, param_name):
         print(module)
         tensor = named_tensor_map['%s.%s' % (module, param_name)]
-        state_dict = gguf_unpack_tensor(tensor, param_name)
+        state_dict = gguf_unpack_tensor(tensor, param_name, device=device)
         output_path = os.path.join(output_dir, '%s.pt' % module)
         torch.save(state_dict, output_path)
         print('saved %s' % output_path)

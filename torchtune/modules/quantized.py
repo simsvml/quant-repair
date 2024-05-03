@@ -14,6 +14,58 @@ def round_ste(t: Tensor) -> Tensor:
     """
     return t + (t.round() - t).detach()
 
+def _expand_bounds(bounds):
+    """
+    Given integer bounds, expand them to floating-point bounds such that all
+    values within the floating-point bounds will round to an integer within the
+    original bounds.
+    """
+    min_bound, max_bound = bounds
+    return min_bound - 0.49, max_bound + 0.49
+
+def latent_to_quantized(x, bounds):
+    """
+    Convert latent weights to quantized weights.  The output will consist
+    entirely of integers within the `bounds`.
+    """
+    min_bound, max_bound = _expand_bounds(bounds)
+    # `clamp` has zero derivative outside the bounds, which can cause weights
+    # near the minimum/maximum to get "stuck".  We instead use `sigmoid` to do
+    # the clamping.  It produces a value in the range `(0, 1)` and has nonzero
+    # derivative everywhere.
+    x = x.sigmoid()
+    # Rescale to the expanded bounds.
+    x = x * (max_bound - min_bound) + min_bound
+    # Round, producing an integer within the original bounds.
+    x = round_ste(x)
+    return x
+
+def quantized_to_latent(x, bounds):
+    """
+    Inverse of `latent_to_quantized`.  This function converts integer-valued
+    quantized weights `x` to floating-point values `y` such that
+    `latent_to_quantized(y, bounds)` produces `x`.
+    """
+    assert x.dtype.is_floating_point, 'must cast x to a floating point type first'
+
+    min_bound, max_bound = _expand_bounds(bounds)
+
+    # These are the inverses of the operations in `latent_to_quantized`,
+    # applied in reverse order.
+
+    # Ignore `round_ste`.  For a quantized weight of 3, there are many values
+    # in the range `(2.5, 3.5)` that would round to the desired output.  We
+    # just pick 3.0 for convenience.
+
+    # Rescale from the expanded bounds to `(0, 1)`.
+    x = (x - min_bound) / (max_bound - min_bound)
+
+    # `logit` is the inverse of `sigmoid`.
+    x = x.logit()
+
+    return x
+
+
 QS_BOUNDS = {
         # KSimple
         GGMLQuantizationType.Q3_K: (-4, 3),
@@ -100,9 +152,9 @@ class QuantizedTensor_KSimple(nn.Module):
         #assert not torch.isnan(self.k_qs).any(), 'got nan in INPUT qs'
         #assert not torch.isnan(self.k_scales).any(), 'got nan in INPUT scales'
         #assert not torch.isnan(self.k_d).any(), 'got nan in INPUT d'
-        qs = round_ste(self.k_qs).clamp(*QS_BOUNDS[self.quant])
+        qs = latent_to_quantized(self.k_qs, QS_BOUNDS[self.quant])
         #assert not torch.isnan(qs).any(), 'got nan in qs'
-        scales = round_ste(self.k_scales).clamp(*SCALES_BOUNDS[self.quant])
+        scales = latent_to_quantized(self.k_scales, SCALES_BOUNDS[self.quant])
         #assert not torch.isnan(scales).any(), 'got nan in scales'
         xs = (self.k_d.unsqueeze(1) * scales).unsqueeze(2) * qs
         #assert not torch.isnan(xs).any(), 'got nan in xs'
@@ -149,13 +201,13 @@ class QuantizedTensor_KWithMin(nn.Module):
         #assert not torch.isnan(self.k_m).any(), 'got nan in INPUT m'
         #assert not torch.isnan(self.k_d).any(), 'got nan in INPUT d'
         #assert not torch.isnan(self.k_dmin).any(), 'got nan in INPUT dmin'
-        qs = round_ste(self.k_qs).clamp(*QS_BOUNDS[self.quant])
+        qs = latent_to_quantized(self.k_qs, QS_BOUNDS[self.quant])
         #assert not torch.isnan(qs).any(), 'got nan in qs'
-        sc = round_ste(self.k_sc).clamp(*SCALES_BOUNDS[self.quant])
+        sc = latent_to_quantized(self.k_sc, SCALES_BOUNDS[self.quant])
         #assert not torch.isnan(sc).any(), 'got nan in sc'
         scale = self.k_d.unsqueeze(1) * sc
         #assert not torch.isnan(scale).any(), 'got nan in scale'
-        m = round_ste(self.k_m).clamp(*SCALES_BOUNDS[self.quant])
+        m = latent_to_quantized(self.k_m, SCALES_BOUNDS[self.quant])
         #assert not torch.isnan(m).any(), 'got nan in m'
         minimum = self.k_dmin.unsqueeze(1) * m
         #assert not torch.isnan(minimum).any(), 'got nan in minimum'
