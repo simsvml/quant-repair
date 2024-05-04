@@ -122,7 +122,7 @@ class QuantizedTensor_KSimple(nn.Module):
     form.  Supports "simple" K-quant formats: `qs * scales * d`.
     """
 
-    def __init__(self, shape, quant) -> None:
+    def __init__(self, shape, quant, *, device=None) -> None:
         super().__init__()
         self.shape = shape
         self._quant = int(quant)
@@ -136,11 +136,11 @@ class QuantizedTensor_KSimple(nn.Module):
         quant_dtype = QUANTIZED_DTYPE[self.quant]
         sub_blocks, elems = SUB_BLOCK_SHAPE[self.quant]
 
-        self.k_qs = nn.Parameter(
-                torch.empty((num_blocks, sub_blocks, elems), dtype=quant_dtype))
-        self.k_scales = nn.Parameter(
-                torch.empty((num_blocks, sub_blocks), dtype=quant_dtype))
-        self.k_d = nn.Parameter(torch.empty((num_blocks,)))
+        self.k_qs = nn.Parameter(torch.empty((num_blocks, sub_blocks, elems),
+            device=device, dtype=quant_dtype))
+        self.k_scales = nn.Parameter(torch.empty((num_blocks, sub_blocks),
+            device=device, dtype=quant_dtype))
+        self.k_d = nn.Parameter(torch.empty((num_blocks,), device=device))
 
         self.output_dtype = torch.get_default_dtype()
 
@@ -166,7 +166,7 @@ class QuantizedTensor_KWithMin(nn.Module):
     form.  Supports K-quant formats with a minimum: `qs * sc * d - m * dmin`.
     """
 
-    def __init__(self, shape, quant) -> None:
+    def __init__(self, shape, quant, *, device=None) -> None:
         super().__init__()
         self.shape = shape
         self._quant = int(quant)
@@ -180,14 +180,14 @@ class QuantizedTensor_KWithMin(nn.Module):
         quant_dtype = QUANTIZED_DTYPE[self.quant]
         sub_blocks, elems = SUB_BLOCK_SHAPE[self.quant]
 
-        self.k_qs = nn.Parameter(
-                torch.empty((num_blocks, sub_blocks, elems), dtype=quant_dtype))
-        self.k_sc = nn.Parameter(
-                torch.empty((num_blocks, sub_blocks), dtype=quant_dtype))
-        self.k_m = nn.Parameter(
-                torch.empty((num_blocks, sub_blocks), dtype=quant_dtype))
-        self.k_d = nn.Parameter(torch.empty((num_blocks,)))
-        self.k_dmin = nn.Parameter(torch.empty((num_blocks,)))
+        self.k_qs = nn.Parameter(torch.empty((num_blocks, sub_blocks, elems),
+            device=device, dtype=quant_dtype))
+        self.k_sc = nn.Parameter(torch.empty((num_blocks, sub_blocks),
+            device=device, dtype=quant_dtype))
+        self.k_m = nn.Parameter(torch.empty((num_blocks, sub_blocks),
+            device=device, dtype=quant_dtype))
+        self.k_d = nn.Parameter(torch.empty((num_blocks,), device=device))
+        self.k_dmin = nn.Parameter(torch.empty((num_blocks,), device=device))
 
         self.output_dtype = torch.get_default_dtype()
 
@@ -226,9 +226,9 @@ QUANTIZED_TENSOR_TYPE = {
         GGMLQuantizationType.Q5_K: QuantizedTensor_KWithMin,
         }
 
-def make_quantized_tensor(shape, quant):
+def make_quantized_tensor(shape, quant, device=None):
     type_ = QUANTIZED_TENSOR_TYPE[quant]
-    return type_(shape, quant)
+    return type_(shape, quant, device=device)
 
 class QuantLinear(nn.Module):
     """
@@ -236,14 +236,16 @@ class QuantLinear(nn.Module):
     """
 
     def __init__(
-        self, in_features, out_features, bias=True, *, weight_quant, bias_quant=None,
+        self, in_features, out_features, bias=True,
+        *, weight_quant, bias_quant=None, device=None,
     ) -> None:
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.weight_quant = make_quantized_tensor((out_features, in_features), weight_quant)
+        self.weight_quant = make_quantized_tensor(
+            (out_features, in_features), weight_quant, device=device)
         if bias:
-            self.bias_quant = make_quantized_tensor((out_features,), bias_quant)
+            self.bias_quant = make_quantized_tensor((out_features,), bias_quant, device=device)
         else:
             self.register_parameter('bias_quant', None)
 

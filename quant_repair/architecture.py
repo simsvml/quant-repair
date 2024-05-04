@@ -22,8 +22,8 @@ def make_linear(in_features, out_features, bias=True, *, weight_quant, bias_quan
     else:
         return nn.Linear(in_features, out_features, bias=bias)
 
-def default_linear(name: str, in_features, out_features, bias=True):
-    return nn.Linear(in_features, out_features, bias=bias)
+def default_linear(name: str, in_features, out_features, bias=True, device=None):
+    return nn.Linear(in_features, out_features, bias=bias, device=device)
 
 
 # From torchtune.models.llama3._model_utils
@@ -102,10 +102,10 @@ class Llama3Arch:
                 return nn.Linear(in_features, out_features, bias=False)
         return self.make_module2(kind, linear=linear)
 
-    def make_module2(self, kind: str, linear=default_linear) -> nn.Module:
+    def make_module2(self, kind: str, linear=default_linear, device=None) -> nn.Module:
         if kind == 'tok_embeddings':
             # TODO: Support quantized embedding
-            return nn.Embedding(self.vocab_size, self.embed_dim)
+            return nn.Embedding(self.vocab_size, self.embed_dim, device=device)
         elif kind == 'layer':
             embed_dim = self.embed_dim
             if self.intermediate_dim is not None:
@@ -114,9 +114,9 @@ class Llama3Arch:
                 hidden_dim = scale_hidden_dim_for_mlp(embed_dim)
 
             # From llama3._component_builders.llama3_mlp
-            gate_proj = linear('layer.mlp.w1', embed_dim, hidden_dim, bias=False)
-            down_proj = linear('layer.mlp.w2', hidden_dim, embed_dim, bias=False)
-            up_proj = linear('layer.mlp.w3', embed_dim, hidden_dim, bias=False)
+            gate_proj = linear('layer.mlp.w1', embed_dim, hidden_dim, bias=False, device=device)
+            down_proj = linear('layer.mlp.w2', hidden_dim, embed_dim, bias=False, device=device)
+            up_proj = linear('layer.mlp.w3', embed_dim, hidden_dim, bias=False, device=device)
             mlp = FeedForward(gate_proj=gate_proj, down_proj=down_proj, up_proj=up_proj)
 
             # From llama3._component_builders.llama3
@@ -132,13 +132,13 @@ class Llama3Arch:
                 num_kv_heads=self.num_kv_heads,
                 head_dim=head_dim,
                 q_proj=linear('layer.attn.q_proj', embed_dim, self.num_heads * head_dim,
-                    bias=False),
+                    bias=False, device=device),
                 k_proj=linear('layer.attn.k_proj', embed_dim, self.num_kv_heads * head_dim,
-                    bias=False),
+                    bias=False, device=device),
                 v_proj=linear('layer.attn.v_proj', embed_dim, self.num_kv_heads * head_dim,
-                    bias=False),
+                    bias=False, device=device),
                 output_proj=linear('layer.attn.output_proj', embed_dim, embed_dim,
-                    bias=False),
+                    bias=False, device=device),
                 pos_embeddings=rope,
                 max_seq_len=self.max_seq_len,
                 attn_dropout=self.attn_dropout,
@@ -151,8 +151,8 @@ class Llama3Arch:
                 mlp_norm=RMSNorm(dim=embed_dim, eps=self.norm_eps),
             )
         elif kind == 'norm':
-            return RMSNorm(self.embed_dim, eps=self.norm_eps)
+            return RMSNorm(self.embed_dim, eps=self.norm_eps, device=device)
         elif kind == 'output':
-            return linear('output', self.embed_dim, self.vocab_size, bias=False)
+            return linear('output', self.embed_dim, self.vocab_size, bias=False, device=device)
         else:
             assert False, 'bad module kind %r' % (kind,)
