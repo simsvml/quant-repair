@@ -23,10 +23,10 @@ class RMSNorm(nn.Module):
         eps (float): small value to avoid division by zero. Default: 1e-6
     """
 
-    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+    def __init__(self, dim: int, eps: float = 1e-6, device = None) -> None:
         super().__init__()
         self.eps = eps
-        self.scale = nn.Parameter(torch.ones(dim))
+        self.scale = nn.Parameter(torch.ones(dim, device=device))
 
     def forward(self, x: Tensor) -> Tensor:
         """
