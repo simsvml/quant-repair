@@ -93,16 +93,16 @@ class Llama3Arch:
     def make_module(self, key) -> nn.Module:
         kind, fmt = key
         quant_map = dict(fmt)
-        def linear(name: str, in_features, out_features, bias=True):
+        def linear(name: str, in_features, out_features, bias=True, device=None):
             assert not bias
             rel_name = ('%s.weight' % name).split('.', 1)[1]
             weight_quant = quant_map[rel_name]
             need_quantized_weight = weight_quant not in quantized.UNQUANTIZED_TYPES
             if need_quantized_weight:
                 return quantized.QuantLinear(in_features, out_features, bias=False,
-                    weight_quant=weight_quant)
+                    weight_quant=weight_quant, device=device)
             else:
-                return nn.Linear(in_features, out_features, bias=False)
+                return nn.Linear(in_features, out_features, bias=False, device=device)
         return self.make_module2(kind, linear=linear)
 
     def make_module2(
