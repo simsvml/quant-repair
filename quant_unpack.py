@@ -35,14 +35,11 @@ def gguf_unpack_tensor(
 
     shape_length = max((j + 1 for j, dim in enumerate(tensor.shape) if dim != 1),
         default=len(tensor.shape))
-    shape = tuple(reversed(tensor.shape[:shape_length]))
+    # Cast to int explicitly, since `ndarray.shape` is a special numpy type.
+    shape = tuple(int(x) for x in reversed(tensor.shape[:shape_length]))
 
     quant = GGMLQuantizationType(tensor.tensor_type)
     print(quant.name, shape, tensor.name)
-
-    # Quantization is current unsupported for these tensors, so dequantize them
-    # and return a normal floating-point representation.
-    dequantize = tensor.name == 'token_embd.weight' or 'norm' in tensor.name
 
     state_dict = {}
 
@@ -74,11 +71,6 @@ def gguf_unpack_tensor(
     elif quant == GGMLQuantizationType.Q6_K:
         qs, scales, d = gguf_quant.unpack_q6_k(tensor.data)
 
-        if dequantize:
-            data = gguf_quant.dequant_q6_k(qs, scales, d)
-            state_dict[output_name] = torch.from_numpy(data).view(*shape)
-            return state_dict
-
         state_dict.update({
             '%s_quant.k_qs' % output_name: conv_qs(qs),
             '%s_quant.k_scales' % output_name: conv_scales(scales),
@@ -86,11 +78,6 @@ def gguf_unpack_tensor(
         })
     elif quant == GGMLQuantizationType.Q5_K:
         qs, sc, m, d, dmin = gguf_quant.test_unpack_q5_k(tensor.data)
-
-        if dequantize:
-            data = gguf_quant.dequant_q5_k(qs, sc, m, d, dmin)
-            state_dict[output_name] = torch.from_numpy(data).view(*shape)
-            return state_dict
 
         state_dict.update({
             '%s_quant.k_qs' % output_name: conv_qs(qs),
@@ -102,11 +89,6 @@ def gguf_unpack_tensor(
     elif quant == GGMLQuantizationType.Q4_K:
         qs, sc, m, d, dmin = gguf_quant.test_unpack_q4_k(tensor.data)
 
-        if dequantize:
-            data = gguf_quant.dequant_q4_k(qs, sc, m, d, dmin)
-            state_dict[output_name] = torch.from_numpy(data).view(*shape)
-            return state_dict
-
         state_dict.update({
             '%s_quant.k_qs' % output_name: conv_qs(qs),
             '%s_quant.k_sc' % output_name: conv_scales(sc),
@@ -117,11 +99,6 @@ def gguf_unpack_tensor(
     elif quant == GGMLQuantizationType.Q3_K:
         qs, scales, d = gguf_quant.test_unpack_q3_k(tensor.data)
 
-        if dequantize:
-            data = gguf_quant.dequant_q3_k(qs, scales, d)
-            state_dict[output_name] = torch.from_numpy(data).view(*shape)
-            return state_dict
-
         state_dict.update({
             '%s_quant.k_qs' % output_name: conv_qs(qs),
             '%s_quant.k_scales' % output_name: conv_scales(scales),
@@ -129,11 +106,6 @@ def gguf_unpack_tensor(
         })
     elif quant == GGMLQuantizationType.Q2_K:
         qs, sc, m, d, dmin = gguf_quant.test_unpack_q2_k(tensor.data)
-
-        if dequantize:
-            data = gguf_quant.dequant_q2_k(qs, sc, m, d, dmin)
-            state_dict[output_name] = torch.from_numpy(data).view(*shape)
-            return state_dict
 
         state_dict.update({
             '%s_quant.k_qs' % output_name: conv_qs(qs),
@@ -145,11 +117,6 @@ def gguf_unpack_tensor(
     elif quant == GGMLQuantizationType.IQ2_XS:
         grids, signs, scales, d = gguf_quant.test_unpack_iq2_xs(tensor.data)
 
-        if dequantize:
-            data = gguf_quant.dequant_iq2_xs(qs, sc, m, d, dmin)
-            state_dict[output_name] = torch.from_numpy(data).view(*shape)
-            return state_dict
-
         state_dict.update({
             # TODO: Convert grids and signs from index to one-hot format
             #'%s_quant.k_grids' % output_name: torch.from_numpy(grids),
@@ -160,6 +127,10 @@ def gguf_unpack_tensor(
     else:
         raise AssertionError('quant %s not implemented for tensor %s' % (
             quant, tensor.name))
+
+    if quant not in quantized.UNQUANTIZED_TYPES:
+        state_dict['%s_quant._quant' % output_name] = int(quant)
+        state_dict['%s_quant._shape' % output_name] = shape
 
     return state_dict
 
@@ -175,6 +146,8 @@ def main():
     reader = GGUFReader(gguf_path)
 
     # Build the list of layer keys.
+    # TODO: Get rid of quant_map and quant_shape_map now that the same data is
+    # stored in `module.param_quant._quant` and `_shape`.
     quant_map = {tensor.name: tensor.tensor_type for tensor in reader.tensors}
     quant_map = convert_weights.gguf_to_tune(quant_map)
 

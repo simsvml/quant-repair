@@ -25,6 +25,9 @@ def make_linear(in_features, out_features, bias=True, *, weight_quant, bias_quan
 def default_linear(name: str, in_features, out_features, bias=True, device=None):
     return nn.Linear(in_features, out_features, bias=bias, device=device)
 
+def default_embedding(name: str, num_embeddings, embedding_dim, device=None):
+    return nn.Embedding(num_embeddings, embedding_dim, device=device)
+
 
 # From torchtune.models.llama3._model_utils
 def scale_hidden_dim_for_mlp(dim: int, multiple_of: int = 256) -> int:
@@ -102,10 +105,15 @@ class Llama3Arch:
                 return nn.Linear(in_features, out_features, bias=False)
         return self.make_module2(kind, linear=linear)
 
-    def make_module2(self, kind: str, linear=default_linear, device=None) -> nn.Module:
+    def make_module2(
+        self,
+        kind: str,
+        linear=default_linear,
+        embedding=default_embedding,
+        device=None,
+    ) -> nn.Module:
         if kind == 'tok_embeddings':
-            # TODO: Support quantized embedding
-            return nn.Embedding(self.vocab_size, self.embed_dim, device=device)
+            return embedding('tok_embeddings', self.vocab_size, self.embed_dim, device=device)
         elif kind == 'layer':
             embed_dim = self.embed_dim
             if self.intermediate_dim is not None:

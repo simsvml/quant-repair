@@ -122,6 +122,8 @@ class QuantizedTensor_KSimple(nn.Module):
     form.  Supports "simple" K-quant formats: `qs * scales * d`.
     """
 
+    PARAMETER_NAMES = ('k_qs', 'k_scales', 'k_d')
+
     def __init__(self, shape, quant, *, device=None) -> None:
         super().__init__()
         self.shape = shape
@@ -148,6 +150,19 @@ class QuantizedTensor_KSimple(nn.Module):
     def quant(self) -> GGMLQuantizationType:
         return GGMLQuantizationType(self._quant)
 
+    def state_dict(self, *args, **kwargs):
+        sd = super().state_dict(*args, **kwargs)
+        sd['_quant'] = self._quant
+        sd['_shape'] = tuple(self.shape)
+        return sd
+
+    def load_state_dict(self, state_dict, *args, **kwargs):
+        quant = state_dict.pop('_quant')
+        assert quant == self._quant
+        shape = state_dict.pop('_shape')
+        assert tuple(shape) == tuple(self.shape)
+        super().load_state_dict(state_dict, *args, **kwargs)
+
     def forward(self) -> Tensor:
         #assert not torch.isnan(self.k_qs).any(), 'got nan in INPUT qs'
         #assert not torch.isnan(self.k_scales).any(), 'got nan in INPUT scales'
@@ -165,6 +180,8 @@ class QuantizedTensor_KWithMin(nn.Module):
     Zero-argument module that just reconstructs a tensor from its quantized
     form.  Supports K-quant formats with a minimum: `qs * sc * d - m * dmin`.
     """
+
+    PARAMETER_NAMES = ('k_qs', 'k_sc', 'k_m', 'k_d', 'k_dmin')
 
     def __init__(self, shape, quant, *, device=None) -> None:
         super().__init__()
@@ -194,6 +211,19 @@ class QuantizedTensor_KWithMin(nn.Module):
     @property
     def quant(self) -> GGMLQuantizationType:
         return GGMLQuantizationType(self._quant)
+
+    def state_dict(self, *args, **kwargs):
+        sd = super().state_dict(*args, **kwargs)
+        sd['_quant'] = self._quant
+        sd['_shape'] = tuple(self.shape)
+        return sd
+
+    def load_state_dict(self, state_dict, *args, **kwargs):
+        quant = state_dict.pop('_quant')
+        assert quant == self._quant
+        shape = state_dict.pop('_shape')
+        assert tuple(shape) == tuple(self.shape)
+        super().load_state_dict(state_dict, *args, **kwargs)
 
     def forward(self) -> Tensor:
         #assert not torch.isnan(self.k_qs).any(), 'got nan in INPUT qs'
@@ -265,6 +295,35 @@ class QuantLinear(nn.Module):
         bias = self.bias_quant.forward() if self.bias_quant is not None else None
         #assert bias is None or not torch.isnan(bias).any(), 'got nan in bias'
         return nn.functional.linear(x, weight, bias)
+
+class QuantEmbedding(nn.Module):
+    """
+    Quantized version of `nn.Embedding`.
+    """
+
+    def __init__(
+        self, num_embeddings, embedding_dim,
+        *, weight_quant, device=None,
+    ) -> None:
+        super().__init__()
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.weight_quant = make_quantized_tensor(
+            (embedding_dim, num_embeddings), weight_quant, device=device)
+
+    @classmethod
+    def from_module(self, m, weight_quant):
+        return QuantEmbedding(
+            m.num_embeddings,
+            m.embedding_dim,
+            weight_quant=weight_quant,
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        weight = self.weight_quant.forward()
+        #assert not torch.isnan(weight).any(), 'got nan in weight'
+        #assert bias is None or not torch.isnan(bias).any(), 'got nan in bias'
+        return nn.functional.embedding(x, weight)
 
 
 UNQUANTIZED_TYPES = {
