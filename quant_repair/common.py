@@ -315,6 +315,10 @@ def load_weights(
                 with torch.no_grad():
                     weights = lora_params['b'] @ lora_params['a']
                     target_key = _join_name(module_name, target_param)
+                    if state_dict[target_key].shape == weights.T.shape:
+                        # The matrix for `nn.Embedding` layers is transposed
+                        # compared to the shape of the LoRA.
+                        weights = weights.T
                     state_dict[target_key] = state_dict[target_key] + weights
 
     #pprint(list(state_dict.keys()))

@@ -111,6 +111,7 @@ class Llama3Arch:
         linear=default_linear,
         embedding=default_embedding,
         device=None,
+        # When adding new arguments, also update the recursive calls below.
     ) -> nn.Module:
         if kind == 'tok_embeddings':
             return embedding('tok_embeddings', self.vocab_size, self.embed_dim, device=device)
@@ -162,5 +163,10 @@ class Llama3Arch:
             return RMSNorm(self.embed_dim, eps=self.norm_eps, device=device)
         elif kind == 'output':
             return linear('output', self.embed_dim, self.vocab_size, bias=False, device=device)
+        elif kind == 'norm_output':
+            return nn.Sequential(
+                self.make_module2('norm', linear=linear, embedding=embedding, device=device),
+                self.make_module2('output', linear=linear, embedding=embedding, device=device),
+            )
         else:
             assert False, 'bad module kind %r' % (kind,)

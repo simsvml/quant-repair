@@ -48,11 +48,11 @@ class EmbeddingLowRankAdapter(nn.Module):
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self.rank = rank
-        self.lora_a = nn.Parameter(torch.empty((num_embeddings, rank), device=device))
+        self.lora_a = nn.Parameter(torch.empty((rank, num_embeddings), device=device))
         self.lora_b = nn.Parameter(torch.empty((embedding_dim, rank), device=device))
 
     def forward(self, x):
-        x = F.embedding(x, self.lora_a)
+        x = F.embedding(x, self.lora_a.T)
         x = F.linear(x, self.lora_b)
         return x
 
@@ -62,10 +62,10 @@ class QuantEmbeddingLowRankAdapter(nn.Module):
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self.rank = rank
-        self.lora_a = make_quantized_tensor((num_embeddings, rank), lora_quant, device=device)
+        self.lora_a = make_quantized_tensor((rank, num_embeddings), lora_quant, device=device)
         self.lora_b = make_quantized_tensor((embedding_dim, rank), lora_quant, device=device)
 
     def forward(self, x):
-        x = F.embedding(x, self.lora_a.forward())
+        x = F.embedding(x, self.lora_a.forward().T)
         x = F.linear(x, self.lora_b.forward())
         return x

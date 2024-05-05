@@ -1,3 +1,4 @@
+from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
 import itertools
@@ -43,6 +44,19 @@ LAYER_PARAMETERS = tuple('%s.weight' % name for name in LAYER_MODULES_LINEAR) + 
     tuple('%s.scale' % name for name in LAYER_MODULES_NORM)
 
 
+def module_index_to_name(arch, index):
+    if index == 0:
+        return 'tok_embeddings'
+    else:
+        index -= 1
+    if index < arch.num_layers:
+        return 'layer%d' % index
+    else:
+        index -= arch.num_layers
+    assert index == 0
+    return 'norm_output'
+
+
 @contextmanager
 def record_time(dest, key):
     start = time.time()
@@ -56,13 +70,26 @@ def main():
             run()
 
 def run():
-    assert len(sys.argv) == 4
+    assert len(sys.argv) in (4, 5)
     orig_dir = sys.argv[1]
     quant_dir = sys.argv[2]
-    train_layer_index = int(sys.argv[3])
+    train_modules_start = int(sys.argv[3])
+    if len(sys.argv) == 5:
+        train_modules_end = int(sys.argv[4])
+    else:
+        train_modules_end = train_modules_start
+
+    # `train_modules_end` is an exclusive bound, so that `range(start, end)`
+    # works properly.
+    assert train_modules_end > train_modules_start
+    assert train_modules_start >= 0
 
     device = torch.device('cuda')
     arch = Llama3Arch.llama3_8b()
+
+    # There are `num_layers + 2` modules: `tok_embeddings`, `num_layers`
+    # layers, and `norm` + `output` (treated as a single module).
+    assert train_modules_end <= arch.num_layers + 2
 
     print('loading original weights from %r' % (orig_dir,))
     orig_state_dict = load_weights_safetensors_hf(orig_dir, arch)
@@ -80,6 +107,8 @@ def run():
     fwd_tok_embeddings.requires_grad_(False)
     fwd_layer = build_module(arch, 'layer', device=device)
     fwd_layer.requires_grad_(False)
+    fwd_norm_output = build_module(arch, 'norm_output', device=device)
+    fwd_norm_output.requires_grad_(False)
 
     def init_fwd_tok_embeddings(loader):
         load_weights(loader, fwd_tok_embeddings, 'tok_embeddings')
@@ -87,24 +116,67 @@ def run():
     def init_fwd_layer(loader, layer_index):
         load_weights(loader, fwd_layer, 'layers.%d' % layer_index)
 
+    def init_fwd_norm_output(loader):
+        load_weights(loader, fwd_norm_output[0], 'norm')
+        load_weights(loader, fwd_norm_output[1], 'output')
+
 
     print('creating training module')
 
     lora_rank = 32
     #lora_quant = GGMLQuantizationType.Q6_K
+    train_lora_only = True
 
-    train_module = build_module(
-        arch,
-        'layer',
-        layer_index = 0,
+    parts = OrderedDict()
+    build_module_kwargs = dict(
         loader = quant_weights,
         base_quant = False,
         lora_rank = lora_rank,
         lora_quant = False,
         device = device,
     )
+    for module_index in range(train_modules_start, train_modules_end):
+        name = module_index_to_name(arch, module_index)
+        assert name not in parts
+        if name == 'tok_embeddings':
+            module = build_module(
+                arch,
+                'tok_embeddings',
+                **build_module_kwargs
+            )
+            load_weights(quant_weights, module, 'tok_embeddings')
+            parts[name] = module
+        elif name.startswith('layer'):
+            layer_index = int(name.removeprefix('layer'))
+            module = build_module(
+                arch,
+                'layer',
+                layer_index = layer_index,
+                **build_module_kwargs
+            )
+            load_weights(quant_weights, module, 'layers.%d' % layer_index)
+            parts[name] = module
+        elif name == 'norm_output':
+            module = build_module(
+                arch,
+                'norm',
+                **build_module_kwargs
+            )
+            load_weights(quant_weights, module, 'norm')
+            parts['norm'] = module
 
-    train_lora_only = True
+            module = build_module(
+                arch,
+                'output',
+                **build_module_kwargs
+            )
+            load_weights(quant_weights, module, 'output')
+            parts['output'] = module
+        else:
+            assert False, 'bad module name %r' % name
+
+    train_module = nn.Sequential(parts)
+
     if train_lora_only:
         train_module.requires_grad_(False)
         train_params = []
@@ -116,14 +188,12 @@ def run():
         train_module.requires_grad_(True)
         train_params = list(train_module.parameters())
 
-    load_weights(quant_weights, train_module, 'layers.%d' % train_layer_index)
-
 
     # Training config
     max_seq_len = 1024
     batch_size = 4
     total_epochs = 1
-    max_steps_per_epoch = 2000
+    max_steps_per_epoch = 1000
     gradient_accumulation_steps = 2
 
     max_samples = gradient_accumulation_steps * max_steps_per_epoch
@@ -142,19 +212,19 @@ def run():
     # Optimizer, learning rate schedule, and loss function
     optimizer = torch.optim.AdamW(
         train_params,
-        lr = 1.0e-6 * math.sqrt(1 + train_layer_index),
+        lr = 1.0e-6,
     )
     lr_scheduler = lr_schedulers.get_exponential_schedule(
         optimizer,
         start_factor = 1.0,
-        end_factor = 0.5,
+        end_factor = 0.2,
         num_training_steps = total_epochs * max_steps_per_epoch,
     )
     loss_fn = nn.MSELoss()
 
 
     # Training loop
-    print('training layer %d' % train_layer_index)
+    print('training modules %s' % [n for n,m in train_module.named_children()])
     log_file = open('train_%d.log' % time.time(), 'w')
     metrics = {
         'quant_time': 0.,
@@ -185,41 +255,76 @@ def run():
             embeds_orig.clear()
             embeds_quant.clear()
 
-            orig_layers_iter = tqdm(range(train_layer_index + 1),
+            orig_modules_pbar = tqdm(total=train_modules_end,
                 desc='orig layers', position=1, leave=False)
-            quant_layers_iter = tqdm(range(train_layer_index),
+            quant_modules_pbar = tqdm(total=train_modules_start,
                 desc='quant layers', position=2, leave=False)
             superbatch_tqdm_kwargs = dict(desc='superbatch', position=3, leave=False)
 
+            def run_forward(weights, embeds, pbar, num_modules):
+                for module_index in range(num_modules):
+                    name = module_index_to_name(arch, module_index)
+                    if name == 'tok_embeddings':
+                        init_fwd_tok_embeddings(weights)
+                        for sample in tqdm(superbatch_samples, **superbatch_tqdm_kwargs):
+                            y = fwd_tok_embeddings(sample.to(device))
+                            embeds.append(y)
+                    elif name.startswith('layer'):
+                        layer_index = int(name.removeprefix('layer'))
+                        init_fwd_layer(weights, layer_index)
+                        embeds.apply(fwd_layer, device=device,
+                            tqdm_kwargs=superbatch_tqdm_kwargs)
+                    elif name == 'norm_output':
+                        # `norm_output` is handled inline during the training
+                        # phase.
+                        break
+                    else:
+                        assert False, 'bad module name %r' % name
+                    pbar.update(1)
+
             with record_time(metrics, 'orig_time'):
-                init_fwd_tok_embeddings(orig_weights)
-                for sample in tqdm(superbatch_samples, **superbatch_tqdm_kwargs):
-                    y = fwd_tok_embeddings(sample.to(device))
-                    embeds_orig.append(y)
-                for layer_index in orig_layers_iter:
-                    init_fwd_layer(orig_weights, layer_index)
-                    embeds_orig.apply(fwd_layer, device=device, tqdm_kwargs=superbatch_tqdm_kwargs)
+                run_forward(orig_weights, embeds_orig, orig_modules_pbar,
+                    train_modules_end)
+                orig_modules_pbar.close()
 
             with record_time(metrics, 'quant_time'):
-                init_fwd_tok_embeddings(quant_weights)
-                for sample in tqdm(superbatch_samples, **superbatch_tqdm_kwargs):
-                    y = fwd_tok_embeddings(sample.to(device))
-                    embeds_quant.append(y)
-                for layer_index in quant_layers_iter:
-                    init_fwd_layer(quant_weights, layer_index)
-                    embeds_quant.apply(fwd_layer, device=device, tqdm_kwargs=superbatch_tqdm_kwargs)
+                run_forward(quant_weights, embeds_quant, quant_modules_pbar,
+                    train_modules_start)
+                quant_modules_pbar.close()
 
 
             # Train using the collected embeddings.
 
+            # The easy case in when the input and output of `train_module` are
+            # both embeddings.  If the input is tokens or the output is logits,
+            # special handling is required.
+            start_with_tok_embeddings = \
+                    module_index_to_name(arch, train_modules_start) == 'tok_embeddings'
+            end_with_norm_output = \
+                    module_index_to_name(arch, train_modules_end - 1) == 'norm_output'
+
+            if end_with_norm_output:
+                init_fwd_norm_output(orig_weights)
+
             with record_time(metrics, 'train_time'):
                 for i in tqdm(range(len(superbatch_samples)), desc='train',
                         position=3, leave=False):
-                    quant_input = embeds_quant[i].to(device)
-                    orig_output = embeds_orig[i].to(device)
-                    train_output = train_module(quant_input)
+                    # Run the remainder of the quant/train model.
+                    if not start_with_tok_embeddings:
+                        quant_input = embeds_quant[i].to(device)
+                        train_output = train_module(quant_input)
+                    else:
+                        sample = superbatch_samples[i].to(device)
+                        train_output = train_module(sample)
 
-                    loss = loss_fn(train_output, orig_output)
+                    # Finish the orig model (if needed) and compute loss.
+                    if not end_with_norm_output:
+                        orig_output = embeds_orig[i].to(device)
+                        loss = loss_fn(train_output, orig_output)
+                    else:
+                        orig_output = fwd_norm_output(embeds_orig[i].to(device))
+                        loss = loss_fn(train_output, orig_output)
+
                     loss = loss / gradient_accumulation_steps
                     loss.backward()
 
@@ -241,18 +346,21 @@ def run():
                     log_file.write('\n')
                     log_file.flush()
 
+        pbar.close()
 
-    train_module_key = 'layer%d' % train_layer_index
-    checkpoint_file_name = quant_weights.next_checkpoint_file(train_module_key)
-    checkpoint_path = os.path.join(quant_dir, checkpoint_file_name)
-    state_dict = train_module.state_dict()
-    if os.path.exists(checkpoint_path):
-        old_checkpoint_path = '%s.old.%d' % (checkpoint_path, time.time())
-        os.rename(checkpoint_path, old_checkpoint_path)
-        tqdm.write('renamed %s -> %s to avoid overwrite' %
-            (checkpoint_path, old_checkpoint_path))
-    torch.save(state_dict, checkpoint_path)
-    tqdm.write('saved %s' % checkpoint_path)
+
+    print('\n\n')
+    for name, module in train_module.named_children():
+        checkpoint_file_name = quant_weights.next_checkpoint_file(name)
+        checkpoint_path = os.path.join(quant_dir, checkpoint_file_name)
+        state_dict = module.state_dict()
+        if os.path.exists(checkpoint_path):
+            old_checkpoint_path = '%s.old.%d' % (checkpoint_path, time.time())
+            os.rename(checkpoint_path, old_checkpoint_path)
+            tqdm.write('renamed %s -> %s to avoid overwrite' %
+                (checkpoint_path, old_checkpoint_path))
+        torch.save(state_dict, checkpoint_path)
+        tqdm.write('saved %s' % checkpoint_path)
 
 
 if __name__ == '__main__':
