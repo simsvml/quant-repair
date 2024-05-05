@@ -17,6 +17,7 @@ from torchtune.modules import quantized, lr_schedulers
 from torchtune.utils import set_default_dtype
 from gguf import GGMLQuantizationType
 from quant_repair.architecture import Llama3Arch
+from quant_repair.common import build_module, load_weights
 from quant_repair.datasets import load_slimorca_dataset
 from quant_repair.forward import SuperbatchEmbeddings, sized_chunks
 from quant_repair.modules import LowRankAdapter, QuantLowRankAdapter, WithAdapter
@@ -40,276 +41,6 @@ LAYER_MODULES_NORM = (
 
 LAYER_PARAMETERS = tuple('%s.weight' % name for name in LAYER_MODULES_LINEAR) + \
     tuple('%s.scale' % name for name in LAYER_MODULES_NORM)
-
-def init_lora_weights(module: LowRankAdapter, module_name: str) -> Dict[str, Tensor]:
-    # Original LoRA paper initializes A to be normally distributed and
-    # initializes B to zero.
-    return {
-        '%s.lora_a' % module_name: torch.normal(0, 1, module.lora_a.shape), 
-        '%s.lora_b' % module_name: torch.zeros(module.lora_b.shape), 
-    }
-
-
-def _join_name(*args) -> str:
-    """
-    Join together parts of a module or parameter name with dots.  Empty
-    components are omitted.
-    """
-    return '.'.join(x for x in args if x != '')
-
-def load_module(
-    loader,
-    arch,
-    kind: str,
-    layer_index: Optional[int] = None,
-    base_quant: bool = False,
-    lora_rank: Optional[int] = None,
-    lora_quant: bool = False,
-    lora_quant_format: Optional[GGMLQuantizationType] = None,
-    device = None,
-) -> nn.Module:
-    """
-    Build a module for training and load its weights.
-
-    Args:
-        loader: used to load weights from a checkpoint.
-        arch: model architecture to create a module for.
-        kind: which module to create from `arch`.
-        layer_index: when building a `layer` module, this gives the layer index
-            whose weights should be loaded.
-        base_quant: if set, use a quantized representation for the base weights.
-        lora_rank: if set, add a LoRA of this rank.
-        lora_quant: if set, use a quantized representation for the LoRA weights.
-        lora_quant_format: if `lora_quant` is set but the `loader` doesn't have
-            a quant format for a LoRA, this format is used instead.
-    """
-
-    lora = lora_rank is not None
-
-    def convert_module_name(name: str) -> str:
-        """
-        Convert generic `layer.foo` to a specific name `layers.0.foo` (using
-        `layer_index` for the index) as it will appear in the checkpoint.
-        """
-        if name.startswith('layer.'):
-            _, rest = name.split('.', 1)
-            return 'layers.%d.%s' % (layer_index, rest)
-        else:
-            return name
-
-    def get_quant_type(
-        module_name: str,
-        param_name: str,
-        for_lora: bool = False,
-    ) -> Optional[GGMLQuantizationType]:
-        if not for_lora:
-            quant = loader.get_quant_type(_join_name(module_name, 'base', param_name))
-            if quant is None:
-                # Try again with the non-LoRA name.
-                quant = loader.get_quant_type(_join_name(module_name, param_name))
-            return quant
-        else:
-            quant = loader.get_quant_type(_join_name(module_name, 'adapter', param_name))
-            if quant is None:
-                quant = lora_quant_format
-            return quant
-
-    def quant_type(
-        module_name: str,
-        param_name: str,
-        for_lora: bool = False,
-    ) -> GGMLQuantizationType:
-        quant = get_quant_type(module_name, param_name, for_lora)
-        assert quant is not None, 'missing quant type for %s.%s (for_lora = %s)' % \
-                (module_name, param_name, for_lora)
-        return quant
-
-    def embedding(name: str, num_embeddings, embedding_dim, device=None):
-        name = convert_module_name(name)
-        if not base_quant:
-            base = nn.Embedding(num_embeddings, embedding_dim, device=device)
-        else:
-            base = quantized.QuantEmbedding(num_embeddings, embedding_dim,
-                weight_quant=quant_type(name, 'weight'),
-                device=device)
-        if not lora:
-            return base
-        else:
-            if not lora_quant:
-                adapter = EmbeddingLowRankAdapter(num_embeddings, embedding_dim, lora_rank,
-                    device=device)
-            else:
-                adapter = QuantEmbeddingLowRankAdapter(num_embeddings, embedding_dim, lora_rank,
-                    lora_quant=quant_type(name, 'lora_a', for_lora=True),
-                    device=device)
-            return WithAdapter(base, adapter)
-
-    def linear(name: str, in_features, out_features, bias=True, device=None):
-        name = convert_module_name(name)
-        if not base_quant:
-            base = nn.Linear(in_features, out_features, bias=bias, device=device)
-        else:
-            base = quantized.QuantLinear(in_features, out_features, bias=bias,
-                weight_quant=quant_type(name, 'weight'),
-                bias_quant=get_quant_type(name, 'bias'),
-                device=device)
-        if not lora:
-            return base
-        else:
-            if not lora_quant:
-                adapter = LowRankAdapter(in_features, out_features, lora_rank,
-                    device=device)
-            else:
-                adapter = QuantLowRankAdapter(in_features, out_features, lora_rank,
-                    lora_quant=quant_type(name, 'lora_a', for_lora=True),
-                    device=device)
-            return WithAdapter(base, adapter)
-
-    module = arch.make_module2(kind, linear=linear, embedding=embedding, device='meta') \
-            .to_empty(device=device)
-    return module
-
-
-def load_weights(
-    loader,
-    module: nn.Module,
-    prefix: str,
-):
-    # Examine module parameters to decide which weights to load.
-
-    @dataclass
-    class NeedWeights:
-        # Original parameter names that should be loaded for this module.
-        params: Set[str]
-        # Whether the base weights should be quantized.
-        quant_base: Optional[bool]
-        # Whether the LoRA weights (if any) should be quantized.
-        quant_lora: Optional[bool]
-        # Whether the module has separate base and LoRA weights, or only base.
-        has_lora: bool
-    # Map from original module name (like `layers.0.mlp.w1`) to info about the
-    # weights required for that module.
-    need_weights = {}
-
-    for param_name, _ in module.named_parameters():
-        module_name, _, param_base_name = param_name.rpartition('.')
-
-        need_quant = module_name.endswith('_quant')
-        if need_quant:
-            # `param_name` was originally like `foo.bar_quant.k_qs`, derived
-            # from parameter name `foo.bar`.  Now `module_name` is something
-            # like `foo.bar_quant`.
-            module_name, _, param_base_name = module_name.removesuffix('_quant').rpartition('.')
-
-        has_lora = False
-        is_lora = False
-        if module_name.endswith('.base'):
-            module_name = module_name.removesuffix('.base')
-            has_lora = True
-        elif module_name.endswith('.adapter'):
-            has_lora = True
-            is_lora = True
-            module_name = module_name.removesuffix('.adapter')
-            # Don't include LoRA param names in `params`.
-            assert param_base_name in ('lora_a', 'lora_b')
-            param_base_name = None
-
-        if module_name not in need_weights:
-            need_weights[module_name] = NeedWeights(
-                params = set(),
-                quant_base = None,
-                quant_lora = None,
-                has_lora = has_lora,
-            )
-
-        nw = need_weights[module_name]
-        if param_base_name is not None:
-            nw.params.add(param_base_name)
-        if not is_lora:
-            if nw.quant_base is None:
-                nw.quant_base = need_quant
-            else:
-                assert nw.quant_base == need_quant, \
-                    'saw mix of quant and unquant base params for %r' % module_name
-        else:
-            if nw.quant_lora is None:
-                nw.quant_lora = need_quant
-            else:
-                assert nw.quant_lora == need_quant, \
-                    'saw mix of quant and unquant lora params for %r' % module_name
-        assert nw.has_lora == has_lora, \
-                'saw mix of lora and non-lora params for %r' % module_name
-
-    #pprint(need_weights)
-
-
-    # Load parameters
-    state_dict = {}
-    for module_name, nw in need_weights.items():
-        for param_name in nw.params:
-            assert nw.quant_base is not None, \
-                    'got params, but quant_base is unset for %r' % module_name
-            key_without_lora = _join_name(prefix, module_name, param_name)
-            key_with_lora = _join_name(prefix, module_name, 'base', param_name)
-            key = key_with_lora if loader.has(key_with_lora) else key_without_lora
-            if not nw.has_lora:
-                result_key = _join_name(module_name, param_name)
-            else:
-                result_key = _join_name(module_name, 'base', param_name)
-            dequant = not nw.quant_base
-            state_dict.update(loader.get(key, result_key, dequant))
-
-        checkpoint_has_lora = loader.has(_join_name(prefix, module_name, 'adapter.lora_a'))
-        if nw.has_lora:
-            assert nw.quant_lora is not None, \
-                    'module has_lora, but quant_lora is unset for %r' % module_name
-            if checkpoint_has_lora:
-                state_dict.update(loader.get_multi(
-                    (
-                        _join_name(prefix, module_name, 'adapter.lora_a'),
-                        _join_name(prefix, module_name, 'adapter.lora_b'),
-                    ),
-                    (
-                        _join_name(module_name, 'adapter.lora_a'),
-                        _join_name(module_name, 'adapter.lora_b'),
-                    ),
-                    dequant = not nw.quant_lora,
-                ))
-            else:
-                # There are no LoRA weights in the checkpoint, so initialize to
-                # some defaults.
-                assert not nw.quant_lora, \
-                        'default initialization of quantized LoRA is not supported yet'
-                lora_module_name = module_name + '.adapter'
-                lora_module = module.get_submodule(lora_module_name)
-                state_dict.update(init_lora_weights(lora_module, lora_module_name))
-        else:
-            if checkpoint_has_lora:
-                # The checkpoint has separate base and LoRA weights, but the
-                # model has only base weights.  Flatten the LoRA into the base.
-                target_params = set(x for x in nw.params if x != 'bias')
-                assert len(target_params) == 1, \
-                    'multiple possible target params for merging %r lora: %r' % \
-                        (module_name, target_params)
-                target_param = target_params.pop()
-
-                assert not nw.quant_base, \
-                    "can't merge LoRA into quantized base for %r" % module_name
-
-                lora_params = loader.get_multi(
-                    (
-                        _join_name(prefix, module_name, 'adapter.lora_a'),
-                        _join_name(prefix, module_name, 'adapter.lora_b'),
-                    ),
-                    ('a', 'b'),
-                    dequant = True,
-                )
-                with torch.no_grad():
-                    weights = lora_params['b'] @ lora_params['a']
-                    state_dict[_join_name(module_name, target_param)] += weights
-
-    #pprint(list(state_dict.keys()))
-    module.load_state_dict(state_dict)
 
 
 @contextmanager
@@ -345,10 +76,10 @@ def run():
     tokenizer = llama3_tokenizer_transformers(tokenizer_json_path)
 
     print('creating forward pass modules')
-    fwd_tok_embeddings = arch.make_module2('tok_embeddings', device='meta') \
-            .requires_grad_(False).to_empty(device=device)
-    fwd_layer = arch.make_module2('layer', device='meta') \
-            .requires_grad_(False).to_empty(device=device)
+    fwd_tok_embeddings = build_module(arch, 'tok_embeddings', device=device)
+    fwd_tok_embeddings.requires_grad_(False)
+    fwd_layer = build_module(arch, 'layer', device=device)
+    fwd_layer.requires_grad_(False)
 
     def init_fwd_tok_embeddings(loader):
         load_weights(loader, fwd_tok_embeddings, 'tok_embeddings')
@@ -362,25 +93,37 @@ def run():
     lora_rank = 32
     #lora_quant = GGMLQuantizationType.Q6_K
 
-    train_module = load_module(
-        quant_weights,
+    train_module = build_module(
         arch,
         'layer',
-        train_layer_index,
+        layer_index = 0,
+        loader = quant_weights,
         base_quant = False,
         lora_rank = lora_rank,
         lora_quant = False,
         device = device,
     )
 
-    load_weights(quant_weights, train_module, 'layers.0')
+    train_lora_only = True
+    if train_lora_only:
+        train_module.requires_grad_(False)
+        train_params = []
+        for name, param in train_module.named_parameters():
+            if '.adapter.' in name:
+                param.requires_grad_(True)
+                train_params.append(param)
+    else:
+        train_module.requires_grad_(True)
+        train_params = list(train_module.parameters())
+
+    load_weights(quant_weights, train_module, 'layers.%d' % train_layer_index)
 
 
     # Training config
     max_seq_len = 1024
     batch_size = 4
     total_epochs = 1
-    max_steps_per_epoch = 1000
+    max_steps_per_epoch = 2000
     gradient_accumulation_steps = 2
 
     max_samples = gradient_accumulation_steps * max_steps_per_epoch
@@ -398,13 +141,13 @@ def run():
 
     # Optimizer, learning rate schedule, and loss function
     optimizer = torch.optim.AdamW(
-        list(param for name, param in train_module.named_parameters() if '.adapter.' in name),
+        train_params,
         lr = 1.0e-6 * math.sqrt(1 + train_layer_index),
     )
     lr_scheduler = lr_schedulers.get_exponential_schedule(
         optimizer,
         start_factor = 1.0,
-        end_factor = 0.1,
+        end_factor = 0.5,
         num_training_steps = total_epochs * max_steps_per_epoch,
     )
     loss_fn = nn.MSELoss()

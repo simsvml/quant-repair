@@ -29,8 +29,11 @@ from gguf import GGUFReader, GGMLQuantizationType
 from torchtune.utils import gguf_quant
 import safetensors.torch
 from tqdm import tqdm
+from quant_repair.common import build_module, load_weights
 from quant_repair.forward import SuperbatchEmbeddings, sized_chunks
 from quant_repair.datasets import load_slimorca_dataset
+from quant_repair.weights import load_weights_safetensors_hf, \
+    CheckpointStateDict, QuantizedCheckpointLoader
 
 
 LAYER_PARAMETERS = {
@@ -84,86 +87,11 @@ def run():
 
 
     print('loading original weights from %r' % (orig_dir,))
-    orig_state_dict = {}
-    for name in os.listdir(orig_dir):
-        if not (name.startswith('model') and name.endswith('.safetensors')):
-            continue
-        # This will mmap the file.  Data will be paged in and out on
-        # demand, so this effectively consumes no RAM.
-        path = os.path.join(orig_dir, name)
-        chunk = safetensors.torch.load_file(path, device='cpu')
-        for key in chunk.keys():
-            assert key not in orig_state_dict, \
-                'duplicate tensor %s found in %s' % (key, path)
-        orig_state_dict.update(chunk)
-    orig_state_dict = convert_weights.hf_to_tune(
-        orig_state_dict,
-        num_heads=arch.num_heads,
-        num_kv_heads=arch.num_kv_heads,
-        dim=arch.embed_dim,
-    )
-
+    orig_state_dict = load_weights_safetensors_hf(orig_dir, arch)
+    orig_weights = CheckpointStateDict(orig_state_dict)
 
     print('loading quantized weights from %r' % (quant_dir,))
-    # Find the newest checkpoint for each module.  We don't load these files
-    # until the data is needed.
-    quant_module_files = {}
-    for name in os.listdir(quant_dir):
-        match = CHECKPOINT_FILE_RE.match(name)
-        if match is None:
-            continue
-        key = match.group(1)
-        version = match.group(3)
-        if version is None:
-            version = -1
-        else:
-            version = int(version)
-        if key not in quant_module_files:
-            insert = True
-        else:
-            old_version = quant_module_files[key][1]
-            insert = version > old_version
-        if insert:
-            quant_module_files[key] = (name, version)
-
-    quant_map = torch.load(os.path.join(quant_dir, 'quant_map.pt'))
-    quant_shape_map = torch.load(os.path.join(quant_dir, 'quant_shape_map.pt'))
-
-    _LAST_QUANT_FILE_PATH = None
-    _LAST_QUANT_STATE_DICT = None
-    def get_dequantized_weights(name):
-        nonlocal _LAST_QUANT_FILE_PATH, _LAST_QUANT_STATE_DICT
-        quant, shape = quant_shape_map[name]
-
-        if name.startswith('layers.'):
-            prefix, layer_index_str, rel_name = name.split('.', 2)
-            layer_index = int(layer_index_str)
-            module_key = 'layer%d' % layer_index
-        else:
-            module_key, rel_name = name.split('.', 1)
-
-        file_name, _ = quant_module_files[module_key]
-        file_path = os.path.join(quant_dir, file_name)
-        if file_path == _LAST_QUANT_FILE_PATH:
-            quant_state_dict = _LAST_QUANT_STATE_DICT
-        else:
-            tqdm.write('load %s' % file_path)
-            quant_state_dict = torch.load(file_path)
-            _LAST_QUANT_STATE_DICT = quant_state_dict
-            _LAST_QUANT_FILE_PATH = file_path
-
-        tqdm.write('get_dequantized_weights(%s)' % name)
-
-        if quant in quantized.UNQUANTIZED_TYPES or module_key == 'tok_embeddings':
-            return quant_state_dict[rel_name]
-        else:
-            m = quantized.make_quantized_tensor(shape, quant)
-            m.load_state_dict({
-                param_name: quant_state_dict['%s_quant.%s' % (rel_name, param_name)]
-                for param_name, _ in m.named_parameters()
-            })
-            return m.forward()
-
+    quant_weights = QuantizedCheckpointLoader(quant_dir, dequant_device=device)
 
     tokenizer_json_path = os.path.join(orig_dir, 'tokenizer.json')
     print('loading tokenizer from %s' % tokenizer_json_path)
@@ -171,41 +99,23 @@ def run():
 
 
     # Build forward-pass modules
-    m_tok_embeddings = arch.make_module(('tok_embeddings',
-        {'weight': GGMLQuantizationType.F16})).to(device)
-    m_layer = arch.make_module(('layer',
-        {name: GGMLQuantizationType.F16 for name in LAYER_PARAMETERS})).to(device)
 
-    m_norm_orig = arch.make_module(('norm',
-        {'scale': GGMLQuantizationType.F16})).to(device)
-    m_output_orig = arch.make_module(('output',
-        {'weight': GGMLQuantizationType.F16})).to(device)
-    m_norm_quant = arch.make_module(('norm',
-        {'scale': GGMLQuantizationType.F16})).to(device)
-    m_output_quant = arch.make_module(('output',
-        {'weight': GGMLQuantizationType.F16})).to(device)
-
-    m_norm_orig.load_state_dict({
-        'scale': orig_state_dict['norm.scale'],
-    })
-    m_output_orig.load_state_dict({
-        'weight': orig_state_dict['output.weight'],
-    })
-
-    m_norm_quant.load_state_dict({
-        'scale': get_dequantized_weights('norm.scale'),
-    })
-    m_output_quant.load_state_dict({
-        'weight': get_dequantized_weights('output.weight'),
-    })
+    m_tok_embeddings = build_module(arch, 'tok_embeddings', device=device)
+#    m_layer = arch.make_module2('layer', device='meta') \
+#            .requires_grad_(False).to_empty(device=device)
+#    m_layer.attn.pos_embeddings.reset_parameters()
+#    m_layer.attn.pos_embeddings.to(device)
+    m_layer = build_module(arch, 'layer', device=device)
+    m_norm = build_module(arch, 'norm', device=device)
+    m_output = build_module(arch, 'output', device=device)
 
 
     # Training config
     max_seq_len = 1024
-    batch_size = 8
+    batch_size = 4
     total_epochs = 1
-    max_steps_per_epoch = 20
-    gradient_accumulation_steps = 8
+    max_steps_per_epoch = 160
+    gradient_accumulation_steps = 2
 
     max_samples = gradient_accumulation_steps * max_steps_per_epoch
 
@@ -257,35 +167,25 @@ def run():
             superbatch_tqdm_kwargs = dict(desc='superbatch', position=2, leave=False)
 
             # Process tok_embeddings modules
-            m_tok_embeddings.load_state_dict({
-                'weight': orig_state_dict['tok_embeddings.weight'],
-            })
+            load_weights(orig_weights, m_tok_embeddings, 'tok_embeddings')
             for sample in tqdm(superbatch_samples, **superbatch_tqdm_kwargs):
                 y = m_tok_embeddings(sample.to(device))
                 embeds_orig.append(y)
 
-            m_tok_embeddings.load_state_dict({
-                'weight': get_dequantized_weights('tok_embeddings.weight'),
-            })
+            load_weights(quant_weights, m_tok_embeddings, 'tok_embeddings')
             for sample in tqdm(superbatch_samples, **superbatch_tqdm_kwargs):
                 y = m_tok_embeddings(sample.to(device))
                 embeds_quant.append(y)
 
             # Process layers
             for layer_index in layers_iter:
-                m_layer.load_state_dict({
-                    name: orig_state_dict['layers.%d.%s' % (layer_index, name)]
-                    for name in LAYER_PARAMETERS
-                })
+                load_weights(orig_weights, m_layer, 'layers.%d' % layer_index)
                 embeds_orig.apply(m_layer, device=device, tqdm_kwargs=superbatch_tqdm_kwargs)
-                tqdm.write('orig %d: %s' % (layer_index, embeds_orig[0][0]))
+                #tqdm.write('orig %d: %s' % (layer_index, embeds_orig[0][0]))
 
-                m_layer.load_state_dict({
-                    name: get_dequantized_weights('layers.%d.%s' % (layer_index, name))
-                    for name in LAYER_PARAMETERS
-                })
+                load_weights(quant_weights, m_layer, 'layers.%d' % layer_index)
                 embeds_quant.apply(m_layer, device=device, tqdm_kwargs=superbatch_tqdm_kwargs)
-                tqdm.write('quant %d: %s' % (layer_index, embeds_quant[0][0]))
+                #tqdm.write('quant %d: %s' % (layer_index, embeds_quant[0][0]))
 
                 for orig_output, quant_output in zip(embeds_orig, embeds_quant):
                     loss = loss_fn(quant_output.to(device), orig_output.to(device))
@@ -300,8 +200,14 @@ def run():
 
             for orig_batch, quant_batch in tqdm(zip(embeds_orig, embeds_quant),
                     total=len(embeds_orig), **superbatch_tqdm_kwargs):
-                orig_logits = m_output_orig(m_norm_orig(orig_batch.to(device)))
-                quant_logits = m_output_quant(m_norm_quant(quant_batch.to(device)))
+                load_weights(orig_weights, m_norm, 'norm')
+                load_weights(orig_weights, m_output, 'output')
+                orig_logits = m_output(m_norm(orig_batch.to(device)))
+
+                load_weights(quant_weights, m_norm, 'norm')
+                load_weights(quant_weights, m_output, 'output')
+                quant_logits = m_output(m_norm(quant_batch.to(device)))
+
                 orig_log_prob = torch.nn.functional.log_softmax(orig_logits, dim=-1)
                 quant_log_prob = torch.nn.functional.log_softmax(quant_logits, dim=-1)
 
