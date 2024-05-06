@@ -193,7 +193,8 @@ def run():
     max_seq_len = 1024
     batch_size = 4
     total_epochs = 1
-    max_steps_per_epoch = 1000
+    #max_steps_per_epoch = 1000
+    max_steps_per_epoch = 2500
     gradient_accumulation_steps = 2
 
     max_samples = gradient_accumulation_steps * max_steps_per_epoch
@@ -212,15 +213,17 @@ def run():
     # Optimizer, learning rate schedule, and loss function
     optimizer = torch.optim.AdamW(
         train_params,
-        lr = 1.0e-6,
+        #lr = 1.0e-6,
+        lr = 1.0e-6 * (1 + 0.1 * train_modules_start),
     )
     lr_scheduler = lr_schedulers.get_exponential_schedule(
         optimizer,
         start_factor = 1.0,
-        end_factor = 0.2,
+        end_factor = 0.1,
         num_training_steps = total_epochs * max_steps_per_epoch,
     )
     loss_fn = nn.MSELoss()
+    kl_div_loss_fn = nn.KLDivLoss(log_target=True, reduction='batchmean')
 
 
     # Training loop
@@ -322,8 +325,16 @@ def run():
                         orig_output = embeds_orig[i].to(device)
                         loss = loss_fn(train_output, orig_output)
                     else:
-                        orig_output = fwd_norm_output(embeds_orig[i].to(device))
-                        loss = loss_fn(train_output, orig_output)
+                        train_logits = train_output
+                        orig_logits = fwd_norm_output(embeds_orig[i].to(device))
+
+                        orig_log_prob = torch.nn.functional.log_softmax(orig_logits, dim=-1)
+                        train_log_prob = torch.nn.functional.log_softmax(train_logits, dim=-1)
+
+                        orig_log_prob = orig_log_prob.view(-1, arch.vocab_size)
+                        train_log_prob = train_log_prob.view(-1, arch.vocab_size)
+
+                        loss = kl_div_loss_fn(train_log_prob, orig_log_prob)
 
                     loss = loss / gradient_accumulation_steps
                     loss.backward()
