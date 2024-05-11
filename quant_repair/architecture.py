@@ -90,6 +90,15 @@ class Llama3Arch:
             rope_base=500000.0,
         )
 
+    def head_dim(self) -> int:
+        return self.embed_dim // self.num_heads
+
+    def hidden_dim(self) -> int:
+        if self.intermediate_dim is not None:
+            return self.intermediate_dim
+        else:
+            return scale_hidden_dim_for_mlp(self.embed_dim)
+
     def make_module(self, key) -> nn.Module:
         kind, fmt = key
         quant_map = dict(fmt)
@@ -117,10 +126,7 @@ class Llama3Arch:
             return embedding('tok_embeddings', self.vocab_size, self.embed_dim, device=device)
         elif kind == 'layer':
             embed_dim = self.embed_dim
-            if self.intermediate_dim is not None:
-                hidden_dim = self.intermediate_dim
-            else:
-                hidden_dim = scale_hidden_dim_for_mlp(embed_dim)
+            hidden_dim = self.hidden_dim()
 
             # From llama3._component_builders.llama3_mlp
             gate_proj = linear('layer.mlp.w1', embed_dim, hidden_dim, bias=False, device=device)
@@ -129,7 +135,7 @@ class Llama3Arch:
             mlp = FeedForward(gate_proj=gate_proj, down_proj=down_proj, up_proj=up_proj)
 
             # From llama3._component_builders.llama3
-            head_dim = embed_dim // self.num_heads
+            head_dim = self.head_dim()
             rope = RotaryPositionalEmbeddings(
                 dim=head_dim,
                 max_seq_len=self.max_seq_len,

@@ -116,10 +116,6 @@ class QuantizedCheckpointLoader:
             if insert:
                 self.checkpoint_files[key] = (name, version)
 
-        # Dict mapping tensor name to `(quant, shape)`.
-        # FIXME: Should use `weights_only=True` here, but it fails
-        self.quant_shape_map = torch.load(os.path.join(quant_dir, 'quant_shape_map.pt'))
-
     def _load_state_dict(self, module):
         file_name, _ = self.checkpoint_files[module]
         file_path = os.path.join(self.quant_dir, file_name)
