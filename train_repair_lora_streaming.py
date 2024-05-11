@@ -9,11 +9,12 @@ from pprint import pprint
 import sys
 import time
 from tqdm import tqdm
-from typing import Optional, List, Tuple, Dict, Set, Any
+from typing import Optional, List, Tuple, Dict, Set, Any, Union, Iterable, Callable
 import weakref
 import torch
 from torch import Tensor
 from torch import nn
+from torch.nn import functional as F
 from torchtune.models.llama3 import llama3_tokenizer_transformers
 from torchtune.modules import quantized, lr_schedulers
 from torchtune.modules import RotaryPositionalEmbeddings
@@ -78,6 +79,13 @@ class MemoryAccounting:
             device = tensor.device,
             desc = desc,
         )
+
+    def register_all(self, tensors: Iterable[Tensor], desc):
+        if DISABLE_MEMORY_ACCOUNTING:
+            return
+
+        for tensor in tensors:
+            self.register(tensor, desc)
 
     def register_params(self, params, desc):
         if DISABLE_MEMORY_ACCOUNTING:
@@ -184,109 +192,94 @@ def weights_getter(loader, device):
     return get1
 
 
-@torch.no_grad()
-def run_forward_superbatch(
+def build_forward_tok_embeddings(
     model: QRF.TransformerDecoder,
     loader,
-    samples,
-    embeds: SuperbatchEmbeddings,
     device,
-):
-    """
-    Process `samples` through all but the output layer of `model`, storing the
-    results in `embeds`.  Uses `loader` to load the weights for each layer, one
-    at a time.
-    """
-    def get1(key):
-        return loader.get(key)[key].to(device)
+) -> Callable[[Tensor], Tensor]:
+    get1 = weights_getter(loader, device)
+    params = QRF.LinearParams(get1('tok_embeddings.weight'))
+    MEMORY_ACCOUNTING.register_params(params, 'build_forward_tok_embeddings params')
+    def run(x):
+        return model.tok_embeddings.run(params, x)
+    return run
 
-    embeds.clear()
-
-    pbar = tqdm(desc = 'superbatch forward', total = 2 + len(model.layers))
-
-    # tok_embeddings
-    params = QRF.EmbeddingParams(get1('tok_embeddings.weight'))
-    MEMORY_ACCOUNTING.register_params(params, 'run_forward_superbatch temp params')
-    for sample in tqdm(samples, desc='superbatch tok_embeddings', leave=False):
-        y = model.tok_embeddings.run(params, sample.to(device))
-        embeds.append(y)
-    del params, sample, y
-    pbar.update(1)
-
-    # layers
-    for i, layer in enumerate(model.layers):
-        params = QRF.TransformerDecoderLayerParams(
-            attn = QRF.CausalSelfAttentionParams(
-                q_proj = QRF.LinearParams(get1('layers.%d.attn.q_proj.weight' % i)),
-                k_proj = QRF.LinearParams(get1('layers.%d.attn.k_proj.weight' % i)),
-                v_proj = QRF.LinearParams(get1('layers.%d.attn.v_proj.weight' % i)),
-                output_proj = QRF.LinearParams(get1('layers.%d.attn.output_proj.weight' % i)),
-            ),
-            mlp = QRF.FeedForwardParams(
-                gate_proj = QRF.LinearParams(get1('layers.%d.mlp.w1.weight' % i)),
-                down_proj = QRF.LinearParams(get1('layers.%d.mlp.w2.weight' % i)),
-                up_proj = QRF.LinearParams(get1('layers.%d.mlp.w3.weight' % i)),
-            ),
-            sa_norm = QRF.RMSNormParams(get1('layers.%d.sa_norm.scale' % i)),
-            mlp_norm = QRF.RMSNormParams(get1('layers.%d.mlp_norm.scale' % i)),
-        )
-        MEMORY_ACCOUNTING.register_params(params, 'run_forward_superbatch temp params')
-        embeds.apply(
-            lambda x: layer.run(params, x),
-            device = device,
-            tqdm_kwargs = dict(desc = 'superbatch layer %d' % i, leave = False),
-        )
-        del params
-        pbar.update(1)
-
-    # norm
-    params = QRF.RMSNormParams(get1('norm.scale'))
-    MEMORY_ACCOUNTING.register_params(params, 'run_forward_superbatch temp params')
-    embeds.apply(
-        lambda x: model.norm.run(params, x),
-        device = device,
-        tqdm_kwargs = dict(desc = 'superbatch norm', leave = False),
+def build_forward_layer(
+    model: QRF.TransformerDecoder,
+    loader,
+    layer_index: int,
+    device,
+) -> Callable[[Tensor], Tensor]:
+    get1 = weights_getter(loader, device)
+    i = layer_index
+    params = QRF.TransformerDecoderLayerParams(
+        attn = QRF.CausalSelfAttentionParams(
+            q_proj = QRF.LinearParams(get1('layers.%d.attn.q_proj.weight' % i)),
+            k_proj = QRF.LinearParams(get1('layers.%d.attn.k_proj.weight' % i)),
+            v_proj = QRF.LinearParams(get1('layers.%d.attn.v_proj.weight' % i)),
+            output_proj = QRF.LinearParams(get1('layers.%d.attn.output_proj.weight' % i)),
+        ),
+        mlp = QRF.FeedForwardParams(
+            gate_proj = QRF.LinearParams(get1('layers.%d.mlp.w1.weight' % i)),
+            down_proj = QRF.LinearParams(get1('layers.%d.mlp.w2.weight' % i)),
+            up_proj = QRF.LinearParams(get1('layers.%d.mlp.w3.weight' % i)),
+        ),
+        sa_norm = QRF.RMSNormParams(get1('layers.%d.sa_norm.scale' % i)),
+        mlp_norm = QRF.RMSNormParams(get1('layers.%d.mlp_norm.scale' % i)),
     )
-    del params
-    pbar.update(1)
+    MEMORY_ACCOUNTING.register_params(params, 'build_forward_layer params')
+    def run(x):
+        return model.layers[layer_index].run(params, x)
+    return run
 
-@torch.no_grad()
-def run_forward_output(
+def build_forward_norm(
     model: QRF.TransformerDecoder,
     loader,
-    x: Tensor,
     device,
-) -> Tensor:
-    # output
+) -> Callable[[Tensor], Tensor]:
+    get1 = weights_getter(loader, device)
+    params = QRF.RMSNormParams(get1('norm.scale'))
+    MEMORY_ACCOUNTING.register_params(params, 'build_forward_norm params')
+    def run(x):
+        return model.norm.run(params, x)
+    return run
+
+def build_forward_output(
+    model: QRF.TransformerDecoder,
+    loader,
+    device,
+) -> Callable[[Tensor], Tensor]:
     get1 = weights_getter(loader, device)
     params = QRF.LinearParams(get1('output.weight'))
-    MEMORY_ACCOUNTING.register_params(params, 'run_forward_output temp params')
-    return model.output.run(params, x)
+    MEMORY_ACCOUNTING.register_params(params, 'build_forward_output params')
+    def run(x):
+        return model.output.run(params, x)
+    return run
 
 
-def run_trainable_tok_embeddings(
-    train_model: QRF.TransformerDecoder,
+def build_trainable_tok_embeddings(
+    model: QRF.TransformerDecoder,
     loader,
     train_params: TrainableParams,
-    x: Tensor,
     device,
-) -> Tensor:
+) -> Callable[[Tensor], Tensor]:
     get1 = weights_getter(loader, device)
     params = QRF.WithAdapterParams(
         base = QRF.LinearParams(get1('tok_embeddings.weight')),
         adapter = train_params.tok_embeddings,
     )
-    MEMORY_ACCOUNTING.register_params(params, 'run_trainable_tok_embeddings temp params')
-    return train_model.tok_embeddings.run(params, x)
+    MEMORY_ACCOUNTING.register_params(params, 'build_trainable_tok_embeddings params')
+    def run(x):
+        return model.tok_embeddings.run(params, x)
+    return run
 
-def run_trainable_layer(
-    train_model: QRF.TransformerDecoder,
+def build_trainable_layer(
+    model: QRF.TransformerDecoder,
     loader,
     train_params: TrainableParams,
     layer_index: int,
-    x: Tensor,
     device,
-) -> Tensor:
+) -> Callable[[Tensor], Tensor]:
     get1 = weights_getter(loader, device)
     train_layer_params = train_params.layers[layer_index]
     params = QRF.TransformerDecoderLayerParams(
@@ -325,52 +318,89 @@ def run_trainable_layer(
         sa_norm = train_layer_params.sa_norm,
         mlp_norm = train_layer_params.mlp_norm,
     )
-    MEMORY_ACCOUNTING.register_params(params, 'run_trainable_layer temp params')
-    return train_model.layers[layer_index].run(params, x)
+    MEMORY_ACCOUNTING.register_params(params, 'build_trainable_layer params')
+    def run(x):
+        return model.layers[layer_index].run(params, x)
+    return run
 
-def run_trainable_norm(
-    train_model: QRF.TransformerDecoder,
+def build_trainable_norm(
+    model: QRF.TransformerDecoder,
     loader,
     train_params: TrainableParams,
-    x: Tensor,
     device,
-) -> Tensor:
+) -> Callable[[Tensor], Tensor]:
     params = train_params.norm
-    MEMORY_ACCOUNTING.register_params(params, 'run_trainable_norm temp params')
-    return train_model.norm.run(params, x)
+    MEMORY_ACCOUNTING.register_params(params, 'build_trainable_norm params')
+    def run(x):
+        return model.norm.run(params, x)
+    return run
 
-def run_trainable_output(
-    train_model: QRF.TransformerDecoder,
+def build_trainable_output(
+    model: QRF.TransformerDecoder,
     loader,
     train_params: TrainableParams,
-    x: Tensor,
     device,
-) -> Tensor:
+) -> Callable[[Tensor], Tensor]:
     get1 = weights_getter(loader, device)
     params = QRF.WithAdapterParams(
         base = QRF.LinearParams(get1('output.weight')),
         adapter = train_params.output,
     )
-    MEMORY_ACCOUNTING.register_params(params, 'run_trainable_output temp params')
-    return train_model.output.run(params, x)
+    MEMORY_ACCOUNTING.register_params(params, 'build_trainable_output params')
+    def run(x):
+        return model.output.run(params, x)
+    return run
 
-def run_trainable_norm_output(
-    train_model: QRF.TransformerDecoder,
+
+@torch.no_grad()
+def run_forward_superbatch(
+    model: QRF.TransformerDecoder,
     loader,
-    train_params: TrainableParams,
-    x: Tensor,
+    samples,
+    embeds: SuperbatchEmbeddings,
     device,
-) -> Tensor:
-    get1 = weights_getter(loader, device)
-    norm_params = train_params.norm
-    output_params = QRF.WithAdapterParams(
-        base = QRF.LinearParams(get1('output.weight')),
-        adapter = train_params.output,
-    )
-    MEMORY_ACCOUNTING.register_params(norm_params, 'run_trainable_norm_output temp params')
-    MEMORY_ACCOUNTING.register_params(output_params, 'run_trainable_norm_output temp params')
-    x = train_model.norm.run(norm_params, x)
-    return train_model.output.run(output_params, x)
+    pbar_forward = None,
+    pbar_layer = None,
+):
+    """
+    Process `samples` through all but the output layer of `model`, storing the
+    results in `embeds`.  Uses `loader` to load the weights for each layer, one
+    at a time.
+    """
+    def get1(key):
+        return loader.get(key)[key].to(device)
+
+    embeds.clear()
+    if pbar_forward is not None:
+        pbar_forward.reset(2 + len(model.layers))
+
+    # tok_embeddings
+    m = build_forward_tok_embeddings(model, loader, device)
+    if pbar_layer is not None:
+        pbar_layer.reset(len(samples))
+    for sample in samples:
+        y = m(sample.to(device))
+        embeds.append(y)
+        if pbar_layer is not None:
+            pbar_layer.update()
+    del m, sample, y
+    if pbar_forward is not None:
+        pbar_forward.update()
+
+    # layers
+    for i in range(len(model.layers)):
+        m = build_forward_layer(model, loader, i, device)
+        embeds.apply(m, device = device, pbar = pbar_layer)
+        del m
+        if pbar_forward is not None:
+            pbar_forward.update()
+
+    # norm
+    m = build_forward_norm(model, loader, device)
+    embeds.apply(m, device = device, pbar = pbar_layer)
+    del m
+    if pbar_forward is not None:
+        pbar_forward.update()
 
 
 def run_backward_step(
@@ -590,12 +620,13 @@ def run():
 
     # Training config
     max_seq_len = 1024
-    batch_size = 4
+    batch_size = 1
     total_epochs = 1
-    max_steps_per_epoch = 3000
+    max_steps_per_epoch = 4
+    #max_steps_per_epoch = 2500
     #max_steps_per_epoch = 1000
     #max_steps_per_epoch = 2500
-    gradient_accumulation_steps = 1
+    gradient_accumulation_steps = 8
 
     max_samples = gradient_accumulation_steps * max_steps_per_epoch
 
@@ -627,7 +658,7 @@ def run():
 
     optimizer = torch.optim.AdamW(
         list(train_params.tensors()),
-        lr = 5e-6,
+        lr = 7e-6,
         weight_decay = 0.01,
     )
     lr_scheduler = lr_schedulers.get_cosine_schedule_with_warmup(
@@ -662,12 +693,17 @@ def run():
 
         samples_iter = (tokens for tokens, labels in dataloader)
         samples_iter = itertools.islice(samples_iter, max_samples)
-        samples_iter = iter(pbar := tqdm(samples_iter,
-            total=max_samples, desc='samples', position=0, leave=True))
-        samples_processed = 0
 
         embeds_orig = SuperbatchEmbeddings(arch, ram_gb=superbatch_mem_gb)
         superbatch_limit = embeds_orig.tokens_free()
+
+
+        pbar_samples = tqdm(desc='samples', total=max_samples, smoothing=0)
+        pbar_superbatch = tqdm(desc='superbatch', total=max_samples)
+        pbar_superbatch_forward = tqdm(desc='superbatch forward', total=2 + arch.num_layers)
+        pbar_superbatch_layer = tqdm(desc='superbatch layer', total=1)
+        pbar_train_forward = tqdm(desc='train forward', total=1)
+        pbar_train_backward = tqdm(desc='train backward', total=1)
 
         for superbatch_samples in sized_chunks(samples_iter, superbatch_limit,
                 lambda t: t.numel()):
@@ -677,121 +713,146 @@ def run():
                 superbatch_samples,
                 embeds_orig,
                 device,
+                pbar_forward = pbar_superbatch_forward,
+                pbar_layer = pbar_superbatch_layer,
             )
+            pbar_superbatch.update(len(superbatch_samples))
 
             MEMORY_ACCOUNTING.report('after forward superbatch')
 
             # Train using the collected embeddings.
             with record_time(metrics, 'train_time'):
-                for i in tqdm(range(len(superbatch_samples)), desc='train', leave=False):
-                    # Run the quant/train model.
-                    sample = superbatch_samples[i].to(device).requires_grad_(False)
-                    MEMORY_ACCOUNTING.register(sample, 'sample')
+                for samples_start in range(0, len(superbatch_samples), gradient_accumulation_steps):
+                    samples = superbatch_samples[samples_start :
+                        samples_start + gradient_accumulation_steps]
+                    samples = [t.to(device).requires_grad_(False) for t in samples]
+                    MEMORY_ACCOUNTING.register_all(samples, 'samples')
 
-                    orig_logits = run_forward_output(
-                        model, orig_weights, embeds_orig[i].to(device), device)
-                    MEMORY_ACCOUNTING.register(orig_logits, 'orig_logits')
+                    pbar_train_forward.reset(2 + arch.num_layers)
+                    pbar_train_backward.reset(1 + 2 + arch.num_layers)
 
-                    MEMORY_ACCOUNTING.report('after orig forward pass')
-
-                    pbar_forward = tqdm(desc = 'train forward', total = 3 + len(model.layers),
-                        leave = False)
-                    pbar_backward = tqdm(desc = 'train backward', total = 3 + len(model.layers),
-                        leave = False)
-
-                    activations = []
+                    activation_checkpoints = []
                     with torch.no_grad():
-                        x = run_trainable_tok_embeddings(model_with_lora, quant_weights,
-                            train_params, sample, device)
-                        MEMORY_ACCOUNTING.register(x, 'activations')
-                        activations.append(x)
-                        pbar_forward.update(1)
+                        m = build_trainable_tok_embeddings(
+                            model_with_lora, quant_weights, train_params, device)
+                        activations = [m(sample) for sample in samples]
+                        MEMORY_ACCOUNTING.register_all(activations, 'activations')
+                        activation_checkpoints.append(activations)
+                        pbar_train_forward.update()
+                        del m
 
                         for i in range(arch.num_layers):
-                            x = run_trainable_layer(model_with_lora, quant_weights,
-                                train_params, i, x, device)
-                            MEMORY_ACCOUNTING.register(x, 'activations')
-                            activations.append(x)
-                            pbar_forward.update(1)
+                            m = build_trainable_layer(
+                                model_with_lora, quant_weights, train_params, i, device)
+                            activations = [m(act) for act in activations]
+                            MEMORY_ACCOUNTING.register(activations, 'activations')
+                            activation_checkpoints.append(activations)
+                            pbar_train_forward.update()
+                            del m
 
-                        x = run_trainable_norm(model_with_lora, quant_weights,
-                            train_params, x, device)
-                        MEMORY_ACCOUNTING.register(x, 'activations')
+                        m = build_trainable_norm(
+                            model_with_lora, quant_weights, train_params, device)
+                        activations = [m(act) for act in activations]
+                        MEMORY_ACCOUNTING.register_all(activations, 'activations')
                         # Norm output is not recorded as a checkpoint.
-                        pbar_forward.update(1)
+                        pbar_train_forward.update()
+                        del m
 
-                        train_logits = run_trainable_output(model_with_lora, quant_weights,
-                            train_params, x, device)
-                        MEMORY_ACCOUNTING.register(train_logits, 'train_logits')
-                        pbar_forward.update(1)
-
-                        del x
+                        # Final activations are kept around for later use in
+                        # calc_loss.
 
                     MEMORY_ACCOUNTING.report('after train forward pass')
 
                     # Run loss forward and backward
-                    def calc_loss(train_logits: Tensor) -> Tensor:
-                        orig_log_prob = torch.nn.functional.log_softmax(orig_logits, dim=-1)
-                        MEMORY_ACCOUNTING.register(orig_log_prob, 'orig_log_prob')
-                        train_log_prob = torch.nn.functional.log_softmax(train_logits, dim=-1)
-                        MEMORY_ACCOUNTING.register(train_log_prob, 'train_log_prob')
+                    m_orig = build_forward_output(model, orig_weights, device)
+                    m_train = build_trainable_output(
+                        model_with_lora, quant_weights, train_params, device)
 
-                        orig_log_prob = orig_log_prob.view(-1, arch.vocab_size)
-                        train_log_prob = train_log_prob.view(-1, arch.vocab_size)
+                    # Sum of loss values (used only for logging).
+                    loss_sum = 0.0
+                    gradients = []
+                    for i in range(len(samples)):
+                        def calc_loss(train_embeds: Tensor) -> Tensor:
+                            orig_logits = m_orig(embeds_orig[samples_start + i].to(device))
+                            MEMORY_ACCOUNTING.register(orig_logits, 'orig_logits')
+                            orig_log_prob = F.log_softmax(orig_logits, dim=-1)
+                            MEMORY_ACCOUNTING.register(orig_log_prob, 'orig_log_prob')
+                            orig_log_prob = orig_log_prob.view(-1, arch.vocab_size)
+                            del orig_logits
 
-                        loss = kl_div_loss_fn(train_log_prob, orig_log_prob)
-                        MEMORY_ACCOUNTING.register(loss, 'loss')
-                        loss = loss / gradient_accumulation_steps
-                        return loss
+                            train_logits = m_train(train_embeds)
+                            MEMORY_ACCOUNTING.register(train_logits, 'train_logits')
+                            train_log_prob = F.log_softmax(train_logits, dim=-1)
+                            MEMORY_ACCOUNTING.register(train_log_prob, 'train_log_prob')
+                            train_log_prob = train_log_prob.view(-1, arch.vocab_size)
+                            del train_logits
 
-                    loss, grad = run_initial_backward_step(train_logits, calc_loss)
-                    MEMORY_ACCOUNTING.register(grad, 'backward gradients')
+                            loss = kl_div_loss_fn(train_log_prob, orig_log_prob)
+                            MEMORY_ACCOUNTING.register(loss, 'loss')
+                            return loss
 
-                    grad = run_backward_step(activations.pop(), grad,
-                        lambda x: run_trainable_norm_output(
-                            model_with_lora, quant_weights, train_params, x, device))
-                    MEMORY_ACCOUNTING.register(grad, 'backward gradients')
-                    pbar_backward.update(1)
+                        train_embeds = activations[i]
+                        loss, grad = run_initial_backward_step(train_embeds, calc_loss)
+                        MEMORY_ACCOUNTING.register(grad, 'backward gradients')
+
+                        gradients.append(grad)
+                        loss_sum += loss.item()
+
+                    loss_avg = loss_sum / len(samples)
+                    del m_orig, m_train
+                    pbar_train_backward.update()
+
+                    # Run remaining backward steps.
+
+                    m = build_trainable_norm(
+                        model_with_lora, quant_weights, train_params, device)
+                    for i, act in enumerate(activation_checkpoints.pop()):
+                        gradients[i] = run_backward_step(act, gradients[i], m)
+                    MEMORY_ACCOUNTING.register_all(gradients, 'backward gradients')
+                    del m, act
+                    pbar_train_backward.update()
 
                     for i in reversed(range(arch.num_layers)):
-                        grad = run_backward_step(activations.pop(), grad,
-                            lambda x: run_trainable_layer(
-                                model_with_lora, quant_weights, train_params, i, x, device))
-                        MEMORY_ACCOUNTING.register(grad, 'backward gradients')
-                        pbar_backward.update(1)
+                        m = build_trainable_layer(
+                            model_with_lora, quant_weights, train_params, i, device)
+                        for j, act in enumerate(activation_checkpoints.pop()):
+                            gradients[j] = run_backward_step(act, gradients[j], m)
+                        MEMORY_ACCOUNTING.register_all(gradients, 'backward gradients')
+                        del m, act
+                        pbar_train_backward.update()
 
-                    run_final_backward_step(sample, grad,
-                        lambda x: run_trainable_tok_embeddings(
-                            model_with_lora, quant_weights, train_params, x, device))
-                    MEMORY_ACCOUNTING.register(grad, 'backward gradients')
-                    pbar_backward.update(1)
+                    m = build_trainable_tok_embeddings(
+                        model_with_lora, quant_weights, train_params, device)
+                    for i, sample in enumerate(samples):
+                        run_final_backward_step(sample, gradients[i], m)
+                    del m, sample, gradients
+                    pbar_train_backward.update()
 
                     MEMORY_ACCOUNTING.report('after train backward pass')
 
-                    del grad
-                    loss = loss.item() * gradient_accumulation_steps
+                    with record_time(metrics, 'opt_time'):
+                        optimizer.step()
+                        optimizer.zero_grad(set_to_none=True)
+                        lr_scheduler.step()
 
-                    samples_processed += 1
-                    if samples_processed % gradient_accumulation_steps == 0:
-                        with record_time(metrics, 'opt_time'):
-                            optimizer.step()
-                            optimizer.zero_grad(set_to_none=True)
-                            lr_scheduler.step()
-
-                    pbar.set_description(
-                        f"{curr_epoch+1}|{samples_processed}|Loss: {loss:.6e}"
+                    pbar_samples.set_description(
+                        f"Loss: {loss_avg:.6e}"
                     )
+                    pbar_samples.update(len(samples))
 
-                    metrics['loss'] = loss
+                    metrics['loss'] = loss_avg
                     metrics['lr'] = optimizer.param_groups[0]["lr"]
                     metrics['gpu_resources'] = torch.cuda.memory_allocated()
                     json.dump(metrics, log_file)
                     log_file.write('\n')
                     log_file.flush()
 
-                    del pbar_forward, pbar_backward
-
-        pbar.close()
+        pbar_samples.close()
+        pbar_superbatch.close()
+        pbar_superbatch_forward.close()
+        pbar_superbatch_layer.close()
+        pbar_train_forward.close()
+        pbar_train_backward.close()
 
     MEMORY_ACCOUNTING.report('after training loop')
 
@@ -826,7 +887,7 @@ def run():
     save_trainable_params('params', train_params)
     checkpoint_path = os.path.join(quant_dir, 'repair_ckpt.pt')
     torch.save(state_dict, checkpoint_path)
-    tqdm.write('saved %s' % checkpoint_path)
+    print('\n\nsaved %s' % checkpoint_path)
 
 
 if __name__ == '__main__':

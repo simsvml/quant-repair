@@ -62,13 +62,19 @@ class SuperbatchEmbeddings:
             batch = self._buffer[start:end, :]
             yield batch.view(info.shape + (self._embed_dim,))
 
-    def apply(self, m: Callable[[Tensor], Tensor], device=None, tqdm_kwargs={}):
+    def apply(self, m: Callable[[Tensor], Tensor], device=None, tqdm_kwargs=None, pbar=None):
         """
         Update each batch by applying `m` to it.
         """
-        for batch in tqdm(self, total=len(self), **tqdm_kwargs):
+        it = self
+        if tqdm_kwargs is not None:
+            it = tqdm(self, total=len(self), **tqdm_kwargs)
+        if pbar is not None:
+            pbar.reset(len(self))
+        for batch in it:
             new = m(batch.to(device))
             batch.copy_(new)
+            pbar.update()
 
 def sized_chunks(xs, limit, measure):
     """
