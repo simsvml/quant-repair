@@ -126,34 +126,37 @@ def run():
         max_seq_len = arch.max_seq_len,
         base = arch.rope_base,
     ).to(device)
-    model = QRF.TransformerDecoder(
-        tok_embeddings = QRF.Embedding(),
-        layers = [
-            QRF.TransformerDecoderLayer(
-                attn = QRF.CausalSelfAttention(
-                    embed_dim = arch.embed_dim,
-                    num_heads = arch.num_heads,
-                    num_kv_heads = arch.num_kv_heads,
-                    head_dim = arch.head_dim(),
-                    q_proj = QRF.Linear(),
-                    k_proj = QRF.Linear(),
-                    v_proj = QRF.Linear(),
-                    output_proj = QRF.Linear(),
-                    pos_embeddings = rope,
-                ),
-                mlp = QRF.FeedForward(
-                    gate_proj = QRF.Linear(),
-                    down_proj = QRF.Linear(),
-                    up_proj = QRF.Linear(),
-                    activation = nn.SiLU(),
-                ),
-                sa_norm = QRF.RMSNorm(eps = arch.norm_eps),
-                mlp_norm = QRF.RMSNorm(eps = arch.norm_eps),
-            ) for i in range(arch.num_layers)
-        ],
-        norm = QRF.RMSNorm(eps = arch.norm_eps),
-        output = QRF.Linear(),
-    )
+    def make_model(make_linear, make_embedding):
+        return QRF.TransformerDecoder(
+            tok_embeddings = make_embedding(),
+            layers = [
+                QRF.TransformerDecoderLayer(
+                    attn = QRF.CausalSelfAttention(
+                        embed_dim = arch.embed_dim,
+                        num_heads = arch.num_heads,
+                        num_kv_heads = arch.num_kv_heads,
+                        head_dim = arch.head_dim(),
+                        q_proj = make_linear(),
+                        k_proj = make_linear(),
+                        v_proj = make_linear(),
+                        output_proj = make_linear(),
+                        pos_embeddings = rope,
+                    ),
+                    mlp = QRF.FeedForward(
+                        gate_proj = make_linear(),
+                        down_proj = make_linear(),
+                        up_proj = make_linear(),
+                        activation = nn.SiLU(),
+                    ),
+                    sa_norm = QRF.RMSNorm(eps = arch.norm_eps),
+                    mlp_norm = QRF.RMSNorm(eps = arch.norm_eps),
+                ) for i in range(arch.num_layers)
+            ],
+            norm = QRF.RMSNorm(eps = arch.norm_eps),
+            output = make_linear(),
+        )
+
+    model = make_model(QRF.Linear, QRF.Embedding)
 
     def embedding_with_lora():
         base = QRF.Embedding()
@@ -165,34 +168,7 @@ def run():
         adapter = QRF.LowRankAdapter()
         return QRF.WithAdapter(base, adapter)
 
-    model_with_lora = QRF.TransformerDecoder(
-        tok_embeddings = embedding_with_lora(),
-        layers = [
-            QRF.TransformerDecoderLayer(
-                attn = QRF.CausalSelfAttention(
-                    embed_dim = arch.embed_dim,
-                    num_heads = arch.num_heads,
-                    num_kv_heads = arch.num_kv_heads,
-                    head_dim = arch.head_dim(),
-                    q_proj = linear_with_lora(),
-                    k_proj = linear_with_lora(),
-                    v_proj = linear_with_lora(),
-                    output_proj = linear_with_lora(),
-                    pos_embeddings = rope,
-                ),
-                mlp = QRF.FeedForward(
-                    gate_proj = linear_with_lora(),
-                    down_proj = linear_with_lora(),
-                    up_proj = linear_with_lora(),
-                    activation = nn.SiLU(),
-                ),
-                sa_norm = QRF.RMSNorm(eps = arch.norm_eps),
-                mlp_norm = QRF.RMSNorm(eps = arch.norm_eps),
-            ) for i in range(arch.num_layers)
-        ],
-        norm = QRF.RMSNorm(eps = arch.norm_eps),
-        output = linear_with_lora(),
-    )
+    model_with_lora = make_model(linear_with_lora, embedding_with_lora)
 
 
     print('initializing trainable parameters')
