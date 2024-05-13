@@ -25,127 +25,13 @@ from quant_repair.common import build_module, load_weights, init_lora_weights
 from quant_repair.datasets import load_slimorca_dataset
 from quant_repair.forward import SuperbatchEmbeddings, sized_chunks
 from quant_repair import functional as QRF
+from quant_repair.memory_accounting import MEMORY_ACCOUNTING
 from quant_repair.modules import LowRankAdapter, QuantLowRankAdapter, WithAdapter
 from quant_repair.weights import load_weights_safetensors_hf, \
     CheckpointStateDict, QuantizedCheckpointLoader
 
 
-def module_index_to_name(arch, index):
-    if index == 0:
-        return 'tok_embeddings'
-    else:
-        index -= 1
-    if index < arch.num_layers:
-        return 'layer%d' % index
-    else:
-        index -= arch.num_layers
-    assert index == 0
-    return 'norm_output'
 
-
-DISABLE_MEMORY_ACCOUNTING = True
-
-@dataclass(frozen=True)
-class MemoryAccountingEntry:
-    tensor: weakref.ref
-    size: int
-    device: torch.device
-    desc: str
-
-class MemoryAccounting:
-    def __init__(self):
-        # Map from `id(tensor)` to a `MemoryAccountingEntry`.  Using
-        # `id(tensor)` as the key ensures we don't record the same tensor
-        # twice.
-        self.entries = {}
-
-    def register(self, tensor, desc):
-        if DISABLE_MEMORY_ACCOUNTING:
-            return
-
-        if tensor.grad is not None:
-            self.register(tensor.grad, 'gradient for ' + desc)
-
-        key = id(tensor)
-
-        old_entry = self.entries.get(key)
-        if old_entry is not None and old_entry.tensor() is tensor:
-            # Don't replace the original entry.
-            return
-
-        self.entries[key] = MemoryAccountingEntry(
-            tensor = weakref.ref(tensor),
-            size = tensor.nbytes,
-            device = tensor.device,
-            desc = desc,
-        )
-
-    def register_all(self, tensors: Iterable[Tensor], desc):
-        if DISABLE_MEMORY_ACCOUNTING:
-            return
-
-        for tensor in tensors:
-            self.register(tensor, desc)
-
-    def register_params(self, params, desc):
-        if DISABLE_MEMORY_ACCOUNTING:
-            return
-
-        for tensor in params.tensors():
-            self.register(tensor, desc)
-
-    def report(self, header=None):
-        if DISABLE_MEMORY_ACCOUNTING:
-            return
-
-        # Bring the `entries` set up to date by removing stale items and adding
-        # missing gradient tensors.
-        del_keys = []
-        add_grads = []
-        for key, entry in self.entries.items():
-            tensor = entry.tensor()
-            if tensor is None:
-                # Weak ref has expired - the tensor has been deallocated.
-                del_keys.append(key)
-                continue
-
-            if tensor.grad is not None:
-                add_grads.append((tensor.grad, entry.desc))
-
-        for key in del_keys:
-            if self.entries[key].tensor() is None:
-                del self.entries[key]
-
-        for (grad_tensor, desc) in add_grads:
-            grad_key = id(grad_tensor)
-            if grad_key not in self.entries or self.entries[grad_key].tensor() is None:
-                self.register(grad_tensor, 'gradient (late) for ' + desc)
-
-        # `sizes[device][desc]` is the total size in bytes of all tensors
-        # matching `device` and `desc`.
-        sizes = defaultdict(lambda: defaultdict(float))
-        for entry in self.entries.values():
-            sizes[str(entry.device)][entry.desc] += entry.size
-
-
-        print(' === Memory Report ===')
-        if header is not None:
-            print(header)
-
-        for device_name, device_sizes in sorted(sizes.items()):
-            print('\nMemory usage for device %s:' % device_name)
-            device_total = 0
-            for desc, size in sorted(device_sizes.items()):
-                print('  %7.3f GB   %s' % (size / 1024**3, desc))
-                device_total += size
-            print('  %7.3f GB   Total' % (device_total / 1024**3))
-            if device_name.startswith('cuda'):
-                torch_size = torch.cuda.memory_allocated(device_name)
-                print('  %7.3f GB   Total (pytorch reported)' % (torch_size / 1024**3))
-                delta = torch_size - device_total
-                print('  %7.3f GB   Unaccounted' % (delta / 1024**3))
-
-MEMORY_ACCOUNTING = MemoryAccounting()
 
 
 @dataclass(frozen=True)
@@ -634,6 +520,8 @@ def run():
     assert len(sys.argv) == 3
     orig_dir = sys.argv[1]
     quant_dir = sys.argv[2]
+
+    MEMORY_ACCOUNTING.disable()
 
     device = torch.device('cuda')
     arch = Llama3Arch.llama3_8b()
