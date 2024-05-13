@@ -2,12 +2,7 @@ from typing import Callable
 from torch import Tensor
 from .. import functional as QRF
 from ..memory_accounting import MEMORY_ACCOUNTING
-
-
-def weights_getter(loader, device):
-    def get1(key):
-        return loader.get(key, dequant=True)[key].to(device)
-    return get1
+from .misc import weights_getter
 
 
 def build_forward_tok_embeddings(

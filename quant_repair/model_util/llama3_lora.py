@@ -3,6 +3,7 @@ from typing import List, Callable
 from torch import Tensor
 from .. import functional as QRF
 from ..memory_accounting import MEMORY_ACCOUNTING
+from .misc import weights_getter
 
 
 @dataclass(frozen=True)
@@ -41,12 +42,6 @@ class TrainableParams:
             yield from layer.tensors()
         yield from self.norm.tensors()
         yield from self.output.tensors()
-
-
-def weights_getter(loader, device):
-    def get1(key):
-        return loader.get(key, dequant=True)[key].to(device)
-    return get1
 
 
 def build_trainable_tok_embeddings(

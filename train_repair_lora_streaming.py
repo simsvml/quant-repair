@@ -27,76 +27,13 @@ from quant_repair.forward import SuperbatchEmbeddings, sized_chunks
 from quant_repair import functional as QRF
 from quant_repair.memory_accounting import MEMORY_ACCOUNTING
 from quant_repair import model_util as QRM
-import quant_repair.model_util.llama3
+from quant_repair.model_util.misc import weights_getter
 from quant_repair.model_util.llama3_lora import TrainableParams, LayerTrainableParams
+from quant_repair.model_util.superbatch import run_forward_superbatch
 from quant_repair.modules import LowRankAdapter, QuantLowRankAdapter, WithAdapter
 from quant_repair.offload import TensorOffload
 from quant_repair.weights import load_weights_safetensors_hf, \
     CheckpointStateDict, QuantizedCheckpointLoader
-
-
-
-
-
-
-
-def weights_getter(loader, device):
-    def get1(key):
-        return loader.get(key, dequant=True)[key].to(device)
-    return get1
-
-
-
-
-@torch.no_grad()
-def run_forward_superbatch(
-    model: QRF.TransformerDecoder,
-    loader,
-    samples,
-    embeds: SuperbatchEmbeddings,
-    device,
-    pbar_forward = None,
-    pbar_layer = None,
-):
-    """
-    Process `samples` through all but the output layer of `model`, storing the
-    results in `embeds`.  Uses `loader` to load the weights for each layer, one
-    at a time.
-    """
-    def get1(key):
-        return loader.get(key)[key].to(device)
-
-    embeds.clear()
-    if pbar_forward is not None:
-        pbar_forward.reset(2 + len(model.layers))
-
-    # tok_embeddings
-    m = QRM.llama3.build_forward_tok_embeddings(model, loader, device)
-    if pbar_layer is not None:
-        pbar_layer.reset(len(samples))
-    for sample in samples:
-        y = m(sample.to(device))
-        embeds.append(y)
-        if pbar_layer is not None:
-            pbar_layer.update()
-    del m, sample, y
-    if pbar_forward is not None:
-        pbar_forward.update()
-
-    # layers
-    for i in range(len(model.layers)):
-        m = QRM.llama3.build_forward_layer(model, loader, i, device)
-        embeds.apply(m, device = device, pbar = pbar_layer)
-        del m
-        if pbar_forward is not None:
-            pbar_forward.update()
-
-    # norm
-    m = QRM.llama3.build_forward_norm(model, loader, device)
-    embeds.apply(m, device = device, pbar = pbar_layer)
-    del m
-    if pbar_forward is not None:
-        pbar_forward.update()
 
 
 def run_backward_step(
