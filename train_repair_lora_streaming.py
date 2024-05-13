@@ -28,6 +28,7 @@ from quant_repair import functional as QRF
 from quant_repair.memory_accounting import MEMORY_ACCOUNTING
 from quant_repair import model_util as QRM
 import quant_repair.model_util.llama3
+from quant_repair.model_util.llama3_lora import TrainableParams, LayerTrainableParams
 from quant_repair.modules import LowRankAdapter, QuantLowRankAdapter, WithAdapter
 from quant_repair.offload import TensorOffload
 from quant_repair.weights import load_weights_safetensors_hf, \
@@ -37,43 +38,6 @@ from quant_repair.weights import load_weights_safetensors_hf, \
 
 
 
-@dataclass(frozen=True)
-class LayerTrainableParams:
-    q_proj: QRF.LowRankAdapterParams
-    k_proj: QRF.LowRankAdapterParams
-    v_proj: QRF.LowRankAdapterParams
-    output_proj: QRF.LowRankAdapterParams
-    gate_proj: QRF.LowRankAdapterParams
-    down_proj: QRF.LowRankAdapterParams
-    up_proj: QRF.LowRankAdapterParams
-    sa_norm: QRF.RMSNormParams
-    mlp_norm: QRF.RMSNormParams
-
-    def tensors(self):
-        yield from self.q_proj.tensors()
-        yield from self.k_proj.tensors()
-        yield from self.v_proj.tensors()
-        yield from self.output_proj.tensors()
-        yield from self.gate_proj.tensors()
-        yield from self.down_proj.tensors()
-        yield from self.up_proj.tensors()
-        yield from self.sa_norm.tensors()
-        yield from self.mlp_norm.tensors()
-
-@dataclass(frozen=True)
-class TrainableParams:
-    tok_embeddings: QRF.LowRankAdapterParams
-    layers: List[LayerTrainableParams]
-    norm: QRF.RMSNormParams
-    output: QRF.LowRankAdapterParams
-
-    def tensors(self):
-        yield from self.tok_embeddings.tensors()
-        for layer in self.layers:
-            yield from layer.tensors()
-        yield from self.norm.tensors()
-        yield from self.output.tensors()
-
 
 
 def weights_getter(loader, device):
@@ -82,99 +46,6 @@ def weights_getter(loader, device):
     return get1
 
 
-def build_trainable_tok_embeddings(
-    model: QRF.TransformerDecoder,
-    loader,
-    train_params: TrainableParams,
-    device,
-) -> Callable[[Tensor], Tensor]:
-    get1 = weights_getter(loader, device)
-    params = QRF.WithAdapterParams(
-        base = QRF.LinearParams(get1('tok_embeddings.weight')),
-        adapter = train_params.tok_embeddings,
-    )
-    MEMORY_ACCOUNTING.register_params(params, 'build_trainable_tok_embeddings params')
-    def run(x):
-        return model.tok_embeddings.run(params, x)
-    return run
-
-def build_trainable_layer(
-    model: QRF.TransformerDecoder,
-    loader,
-    train_params: TrainableParams,
-    layer_index: int,
-    device,
-) -> Callable[[Tensor], Tensor]:
-    get1 = weights_getter(loader, device)
-    train_layer_params = train_params.layers[layer_index]
-    params = QRF.TransformerDecoderLayerParams(
-        attn = QRF.CausalSelfAttentionParams(
-            q_proj = QRF.WithAdapterParams(
-                base = QRF.LinearParams(get1('layers.%d.attn.q_proj.weight' % layer_index)),
-                adapter = train_layer_params.q_proj,
-            ),
-            k_proj = QRF.WithAdapterParams(
-                base = QRF.LinearParams(get1('layers.%d.attn.k_proj.weight' % layer_index)),
-                adapter = train_layer_params.k_proj,
-            ),
-            v_proj = QRF.WithAdapterParams(
-                base = QRF.LinearParams(get1('layers.%d.attn.v_proj.weight' % layer_index)),
-                adapter = train_layer_params.v_proj,
-            ),
-            output_proj = QRF.WithAdapterParams(
-                base = QRF.LinearParams(get1('layers.%d.attn.output_proj.weight' % layer_index)),
-                adapter = train_layer_params.output_proj,
-            ),
-        ),
-        mlp = QRF.FeedForwardParams(
-            gate_proj = QRF.WithAdapterParams(
-                base = QRF.LinearParams(get1('layers.%d.mlp.w1.weight' % layer_index)),
-                adapter = train_layer_params.gate_proj,
-            ),
-            down_proj = QRF.WithAdapterParams(
-                base = QRF.LinearParams(get1('layers.%d.mlp.w2.weight' % layer_index)),
-                adapter = train_layer_params.down_proj,
-            ),
-            up_proj = QRF.WithAdapterParams(
-                base = QRF.LinearParams(get1('layers.%d.mlp.w3.weight' % layer_index)),
-                adapter = train_layer_params.up_proj,
-            ),
-        ),
-        sa_norm = train_layer_params.sa_norm,
-        mlp_norm = train_layer_params.mlp_norm,
-    )
-    MEMORY_ACCOUNTING.register_params(params, 'build_trainable_layer params')
-    def run(x):
-        return model.layers[layer_index].run(params, x)
-    return run
-
-def build_trainable_norm(
-    model: QRF.TransformerDecoder,
-    loader,
-    train_params: TrainableParams,
-    device,
-) -> Callable[[Tensor], Tensor]:
-    params = train_params.norm
-    MEMORY_ACCOUNTING.register_params(params, 'build_trainable_norm params')
-    def run(x):
-        return model.norm.run(params, x)
-    return run
-
-def build_trainable_output(
-    model: QRF.TransformerDecoder,
-    loader,
-    train_params: TrainableParams,
-    device,
-) -> Callable[[Tensor], Tensor]:
-    get1 = weights_getter(loader, device)
-    params = QRF.WithAdapterParams(
-        base = QRF.LinearParams(get1('output.weight')),
-        adapter = train_params.output,
-    )
-    MEMORY_ACCOUNTING.register_params(params, 'build_trainable_output params')
-    def run(x):
-        return model.output.run(params, x)
-    return run
 
 
 @torch.no_grad()
@@ -597,7 +468,7 @@ def run():
 
                     activation_checkpoints = []
                     with torch.no_grad():
-                        m = build_trainable_tok_embeddings(
+                        m = QRM.llama3_lora.build_trainable_tok_embeddings(
                             model_with_lora, quant_weights, train_params, device)
                         activations = [m(sample) for sample in samples]
                         MEMORY_ACCOUNTING.register_all(activations, 'activations')
@@ -606,7 +477,7 @@ def run():
                         del m
 
                         for i in range(arch.num_layers):
-                            m = build_trainable_layer(
+                            m = QRM.llama3_lora.build_trainable_layer(
                                 model_with_lora, quant_weights, train_params, i, device)
                             activations = [m(act) for act in activations]
                             MEMORY_ACCOUNTING.register(activations, 'activations')
@@ -614,7 +485,7 @@ def run():
                             pbar_train_forward.update()
                             del m
 
-                        m = build_trainable_norm(
+                        m = QRM.llama3_lora.build_trainable_norm(
                             model_with_lora, quant_weights, train_params, device)
                         activations = [m(act) for act in activations]
                         MEMORY_ACCOUNTING.register_all(activations, 'activations')
@@ -629,7 +500,7 @@ def run():
 
                     # Run loss forward and backward
                     m_orig = QRM.llama3.build_forward_output(model, orig_weights, device)
-                    m_train = build_trainable_output(
+                    m_train = QRM.llama3_lora.build_trainable_output(
                         model_with_lora, quant_weights, train_params, device)
 
                     # Sum of loss values (used only for logging).
@@ -668,7 +539,7 @@ def run():
 
                     # Run remaining backward steps.
 
-                    m = build_trainable_norm(
+                    m = QRM.llama3_lora.build_trainable_norm(
                         model_with_lora, quant_weights, train_params, device)
                     for i, act in enumerate(activation_checkpoints.pop()):
                         gradients[i] = run_backward_step(act, gradients[i], m)
@@ -677,7 +548,7 @@ def run():
                     pbar_train_backward.update()
 
                     for i in reversed(range(arch.num_layers)):
-                        m = build_trainable_layer(
+                        m = QRM.llama3_lora.build_trainable_layer(
                             model_with_lora, quant_weights, train_params, i, device)
                         for j, act in enumerate(activation_checkpoints.pop()):
                             gradients[j] = run_backward_step(act, gradients[j], m)
@@ -685,7 +556,7 @@ def run():
                         del m, act
                         pbar_train_backward.update()
 
-                    m = build_trainable_tok_embeddings(
+                    m = QRM.llama3_lora.build_trainable_tok_embeddings(
                         model_with_lora, quant_weights, train_params, device)
                     for i, sample in enumerate(samples):
                         run_final_backward_step(sample, gradients[i], m)
