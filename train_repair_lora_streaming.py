@@ -26,6 +26,8 @@ from quant_repair.datasets import load_slimorca_dataset
 from quant_repair.forward import SuperbatchEmbeddings, sized_chunks
 from quant_repair import functional as QRF
 from quant_repair.memory_accounting import MEMORY_ACCOUNTING
+from quant_repair import model_util as QRM
+import quant_repair.model_util.llama3
 from quant_repair.modules import LowRankAdapter, QuantLowRankAdapter, WithAdapter
 from quant_repair.offload import TensorOffload
 from quant_repair.weights import load_weights_safetensors_hf, \
@@ -73,75 +75,11 @@ class TrainableParams:
         yield from self.output.tensors()
 
 
+
 def weights_getter(loader, device):
     def get1(key):
         return loader.get(key, dequant=True)[key].to(device)
     return get1
-
-
-def build_forward_tok_embeddings(
-    model: QRF.TransformerDecoder,
-    loader,
-    device,
-) -> Callable[[Tensor], Tensor]:
-    get1 = weights_getter(loader, device)
-    params = QRF.LinearParams(get1('tok_embeddings.weight'))
-    MEMORY_ACCOUNTING.register_params(params, 'build_forward_tok_embeddings params')
-    def run(x):
-        return model.tok_embeddings.run(params, x)
-    return run
-
-def build_forward_layer(
-    model: QRF.TransformerDecoder,
-    loader,
-    layer_index: int,
-    device,
-) -> Callable[[Tensor], Tensor]:
-    get1 = weights_getter(loader, device)
-    i = layer_index
-    params = QRF.TransformerDecoderLayerParams(
-        attn = QRF.CausalSelfAttentionParams(
-            q_proj = QRF.LinearParams(get1('layers.%d.attn.q_proj.weight' % i)),
-            k_proj = QRF.LinearParams(get1('layers.%d.attn.k_proj.weight' % i)),
-            v_proj = QRF.LinearParams(get1('layers.%d.attn.v_proj.weight' % i)),
-            output_proj = QRF.LinearParams(get1('layers.%d.attn.output_proj.weight' % i)),
-        ),
-        mlp = QRF.FeedForwardParams(
-            gate_proj = QRF.LinearParams(get1('layers.%d.mlp.w1.weight' % i)),
-            down_proj = QRF.LinearParams(get1('layers.%d.mlp.w2.weight' % i)),
-            up_proj = QRF.LinearParams(get1('layers.%d.mlp.w3.weight' % i)),
-        ),
-        sa_norm = QRF.RMSNormParams(get1('layers.%d.sa_norm.scale' % i)),
-        mlp_norm = QRF.RMSNormParams(get1('layers.%d.mlp_norm.scale' % i)),
-    )
-    MEMORY_ACCOUNTING.register_params(params, 'build_forward_layer params')
-    def run(x):
-        return model.layers[layer_index].run(params, x)
-    return run
-
-def build_forward_norm(
-    model: QRF.TransformerDecoder,
-    loader,
-    device,
-) -> Callable[[Tensor], Tensor]:
-    get1 = weights_getter(loader, device)
-    params = QRF.RMSNormParams(get1('norm.scale'))
-    MEMORY_ACCOUNTING.register_params(params, 'build_forward_norm params')
-    def run(x):
-        return model.norm.run(params, x)
-    return run
-
-def build_forward_output(
-    model: QRF.TransformerDecoder,
-    loader,
-    device,
-) -> Callable[[Tensor], Tensor]:
-    get1 = weights_getter(loader, device)
-    params = QRF.LinearParams(get1('output.weight'))
-    MEMORY_ACCOUNTING.register_params(params, 'build_forward_output params')
-    def run(x):
-        return model.output.run(params, x)
-    return run
 
 
 def build_trainable_tok_embeddings(
@@ -262,7 +200,7 @@ def run_forward_superbatch(
         pbar_forward.reset(2 + len(model.layers))
 
     # tok_embeddings
-    m = build_forward_tok_embeddings(model, loader, device)
+    m = QRM.llama3.build_forward_tok_embeddings(model, loader, device)
     if pbar_layer is not None:
         pbar_layer.reset(len(samples))
     for sample in samples:
@@ -276,14 +214,14 @@ def run_forward_superbatch(
 
     # layers
     for i in range(len(model.layers)):
-        m = build_forward_layer(model, loader, i, device)
+        m = QRM.llama3.build_forward_layer(model, loader, i, device)
         embeds.apply(m, device = device, pbar = pbar_layer)
         del m
         if pbar_forward is not None:
             pbar_forward.update()
 
     # norm
-    m = build_forward_norm(model, loader, device)
+    m = QRM.llama3.build_forward_norm(model, loader, device)
     embeds.apply(m, device = device, pbar = pbar_layer)
     del m
     if pbar_forward is not None:
@@ -690,7 +628,7 @@ def run():
                     MEMORY_ACCOUNTING.report('after train forward pass')
 
                     # Run loss forward and backward
-                    m_orig = build_forward_output(model, orig_weights, device)
+                    m_orig = QRM.llama3.build_forward_output(model, orig_weights, device)
                     m_train = build_trainable_output(
                         model_with_lora, quant_weights, train_params, device)
 
