@@ -15,19 +15,29 @@ def render(name, bpw, points):
         plt.annotate("", xy=(bpw2, kl_div2), xytext=(bpw1, kl_div1),
             arrowprops=dict(arrowstyle="->", color=sc.get_edgecolor()))
 
+fig, ax = plt.subplots()
+
 plt.xlabel('Bits per weight')
 plt.ylabel('KL divergence (mean)')
 plt.yscale('log')
+
+repaired_kl_div = 1.35e-1
+
+plt.hlines([repaired_kl_div], 0, 1, transform=ax.get_yaxis_transform(),
+    linestyle='dotted')
+
 render('Q2_K', 3.167, [
-    (0, 2.825637e-01),
-    #(0.184, 1.102156e-01),
-    (0.184, 9.422227e-02),
+    (0, 4.333135e-01),
+    (0.184, repaired_kl_div),
 ])
-render('Q3_K_M', 4.004, 8.982828e-02)
-render('Q4_K_M', 4.903, 3.029343e-02)
-render('Q4_K_S', 4.676, 4.992203e-02)
-render('Q5_K_M', 5.712, 9.637030e-03)
-render('Q6_K', 6.572, 5.705326e-03)
+render('Q3_K_M', 4.004, 9.097217e-02)
+render('Q4_K_S', 4.676, 4.503101e-02)
+render('Q4_K_M', 4.903, 3.345483e-02)
+render('Q5_K_M', 5.712, 9.328476e-03)
+render('Q6_K', 6.572, 5.011368e-03)
+
+render('IQ2_XS', 2.597, 5.132598e-01)
+#render('IQ2_XXS', 2.391, ???)
 
 plt.savefig('graph.png')
 plt.show()

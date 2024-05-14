@@ -11,6 +11,8 @@ for line in sys.stdin:
     if line.strip() == '':
         continue
     metrics = json.loads(line)
+    if 'loss' not in metrics:
+        continue
     loss = metrics['loss']
     lr = metrics['lr']
     if i < 3:

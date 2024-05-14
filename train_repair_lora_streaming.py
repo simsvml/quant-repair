@@ -233,11 +233,11 @@ def run():
     max_seq_len = 1024
     batch_size = 1
     total_epochs = 1
-    max_steps_per_epoch = 4
+    max_steps_per_epoch = 8500
     #max_steps_per_epoch = 2500
     #max_steps_per_epoch = 1000
     #max_steps_per_epoch = 2500
-    gradient_accumulation_steps = 8
+    gradient_accumulation_steps = 16
 
     max_samples = gradient_accumulation_steps * max_steps_per_epoch
 
@@ -269,12 +269,19 @@ def run():
 
     optimizer = torch.optim.AdamW(
         list(train_params.tensors()),
-        lr = 7e-6,
+        lr = 8e-6,
         weight_decay = 0.01,
+        #weight_decay = 0,
     )
-    lr_scheduler = lr_schedulers.get_cosine_schedule_with_warmup(
+#    lr_scheduler = lr_schedulers.get_cosine_schedule_with_warmup(
+#        optimizer,
+#        num_warmup_steps = 100,
+#        num_training_steps = total_epochs * max_steps_per_epoch,
+#    )
+    lr_scheduler = lr_schedulers.get_linear_schedule(
         optimizer,
-        num_warmup_steps = 100,
+        start_factor = 1.0,
+        end_factor = 0.1,
         num_training_steps = total_epochs * max_steps_per_epoch,
     )
 
@@ -324,7 +331,26 @@ def run():
 
     # Training loop
     print('training %d parameter tensors' % (len(list(train_params.tensors()))))
+
     log_file = open('train_%d.log' % time.time(), 'w')
+    def write_log(obj):
+        json.dump(obj, log_file)
+        log_file.write('\n')
+        log_file.flush()
+    config_dict = {
+        'max_seq_len': max_seq_len,
+        'batch_size': batch_size,
+        'total_epochs': total_epochs,
+        'max_steps_per_epoch': max_steps_per_epoch,
+        'gradient_accumulation_steps': gradient_accumulation_steps,
+        'lr': optimizer.defaults['lr'],
+        'weight_decay': optimizer.defaults['weight_decay'],
+        'scheduler': str(lr_scheduler),
+    }
+    if isinstance(lr_scheduler, torch.optim.lr_scheduler.LambdaLR):
+        config_dict['lr_lambdas'] = [str(l) for l in lr_scheduler.lr_lambdas]
+    write_log(config_dict)
+
     metrics = {
         'quant_time': 0.,
         'orig_time': 0.,
@@ -352,6 +378,8 @@ def run():
         pbar_superbatch_layer = tqdm(desc='superbatch layer', total=1)
         pbar_train_forward = tqdm(desc='train forward', total=1)
         pbar_train_backward = tqdm(desc='train backward', total=1)
+
+        total_tokens = 0
 
         for superbatch_samples in sized_chunks(samples_iter, superbatch_limit,
                 lambda t: t.numel()):
@@ -487,13 +515,12 @@ def run():
                         f"Loss: {loss_avg:.6e}"
                     )
                     pbar_samples.update(len(samples))
+                    total_tokens += sum(x.numel() for x in samples)
 
                     metrics['loss'] = loss_avg
                     metrics['lr'] = optimizer.param_groups[0]["lr"]
                     metrics['gpu_resources'] = torch.cuda.memory_allocated()
-                    json.dump(metrics, log_file)
-                    log_file.write('\n')
-                    log_file.flush()
+                    write_log(metrics)
 
         pbar_samples.close()
         pbar_superbatch.close()
@@ -501,6 +528,8 @@ def run():
         pbar_superbatch_layer.close()
         pbar_train_forward.close()
         pbar_train_backward.close()
+
+        print('trained on %d tokens' % total_tokens)
 
     MEMORY_ACCOUNTING.report('after training loop')
 

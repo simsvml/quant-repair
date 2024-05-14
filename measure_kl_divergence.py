@@ -1,230 +1,298 @@
+from collections import OrderedDict, defaultdict
+from contextlib import contextmanager
+from dataclasses import dataclass
+import itertools
+import json
+import math
 import os
-import re
+from pprint import pprint
 import sys
-from tempfile import TemporaryDirectory
+import time
+from tqdm import tqdm
+from typing import Optional, List, Tuple, Dict, Set, Any, Union, Iterable, Callable
+import weakref
 import torch
 from torch import Tensor
-from torchtune.modules import quantized
-from torchtune.models import convert_weights
-from torchtune.models.llama3 import llama3_8b, llama3_tokenizer_transformers
-from torchtune.utils import FullModelHFCheckpointer, set_default_dtype
-
-
-ADAPTER_FILE_NAME_REGEX = re.compile(r'adapter_([0-9]+)\.pt')
-
-LAYER_PARAMETERS = {
-    'attn.k_proj.weight',
-    'attn.output_proj.weight',
-    'attn.q_proj.weight',
-    'attn.v_proj.weight',
-    'mlp.w1.weight',
-    'mlp.w2.weight',
-    'mlp.w3.weight',
-    'mlp_norm.scale',
-    'sa_norm.scale',
-}
-
-
-class SlowTransformerDecoder(torch.nn.Module):
-    '''Like `TransformerDecoder`, but loads the weights from CPU to GPU between
-    layers.  As a result, it uses very little GPU memory, but runs slower.'''
-    def __init__(self, orig_model, state_dict):
-        super().__init__()
-
-        self.tok_embeddings = orig_model.tok_embeddings
-        self.layer = orig_model.layers[0]
-        self.num_layers = len(orig_model.layers)
-        self.norm = orig_model.norm
-        self.output = orig_model.output
-
-        self.full_state_dict = state_dict
-
-        self.tok_embeddings.load_state_dict({
-            'weight': state_dict['tok_embeddings.weight'],
-        })
-        self.norm.load_state_dict({
-            'scale': state_dict['norm.scale'],
-        })
-        self.output.load_state_dict({
-            'weight': state_dict['output.weight'],
-        })
-
-    def layer_state_dict(self, i):
-        state_dict = {}
-        for key in LAYER_PARAMETERS:
-            state_dict[key] = self.full_state_dict['layers.%d.%s' % (i, key)]
-        return state_dict
-
-    def forward(self, tokens: Tensor) -> Tensor:
-        # input tensor of shape [b, s]
-        bsz, seq_len = tokens.shape
-
-        # shape: [b, s, d]
-        h = self.tok_embeddings(tokens)
-
-        # Attention mask and input pos are always `None`.
-        mask = None
-        input_pos = None
-
-        for i in range(self.num_layers):
-            # Update `self.layer` with the weights for this layer
-            self.layer.load_state_dict(self.layer_state_dict(i))
-
-            # shape: [b, s, d]
-            h = self.layer(h, mask, input_pos)
-
-        # shape: [b, s, d]
-        h = self.norm(h)
-
-        # shape: [b, s, v]
-        output = self.output(h).float()
-        return output
-
-
-def top_tokens(tokenizer, logits, top_k=3, temperature=1.0):
-    # https://medium.com/@pashashaik/natural-language-generation-from-scratch-in-large-language-models-with-pytorch-4d9379635316
-    next_token_logits = logits[0, -1, :]
-    top_k_logits, top_k_indices = torch.topk(next_token_logits, top_k)
-    top_k_probs = torch.nn.functional.softmax(top_k_logits / temperature, dim=-1)
-    print(next_token_logits.shape)
-    print(top_k_logits)
-    print(top_k_indices)
-    print(top_k_probs)
-    return [(prob.item(), tokenizer.decode(token)) for prob, token in zip(top_k_probs, top_k_indices)]
+from torch import nn
+from torch.nn import functional as F
+from torchtune.models.llama3 import llama3_tokenizer_transformers
+from torchtune.modules import quantized, lr_schedulers
+from torchtune.modules import RotaryPositionalEmbeddings
+from torchtune.utils import set_default_dtype
+from gguf import GGMLQuantizationType
+from quant_repair.architecture import Llama3Arch
+from quant_repair.common import build_module, load_weights, init_lora_weights
+from quant_repair.datasets import load_slimorca_dataset
+from quant_repair.forward import SuperbatchEmbeddings, sized_chunks
+from quant_repair import functional as QRF
+from quant_repair.memory_accounting import MEMORY_ACCOUNTING
+from quant_repair import model_util as QRM
+from quant_repair.model_util.misc import weights_getter
+from quant_repair.model_util.llama3_lora import TrainableParams, LayerTrainableParams
+from quant_repair.model_util.superbatch import run_forward_superbatch2
+from quant_repair.modules import LowRankAdapter, QuantLowRankAdapter, WithAdapter
+from quant_repair.offload import TensorOffload
+from quant_repair.weights import load_weights_safetensors_hf, \
+    CheckpointStateDict, QuantizedCheckpointLoader
 
 
 def main():
     with set_default_dtype(torch.bfloat16):
-        with torch.no_grad():
+        #with torch.no_grad():
             run()
 
 def run():
-    assert len(sys.argv) == 2
-    dir_path = sys.argv[1]
+    assert len(sys.argv) in (3, 4)
+    orig_dir = sys.argv[1]
+    quant_dir = sys.argv[2]
+    if len(sys.argv) >= 4:
+        lora_path = sys.argv[3]
+    else:
+        lora_path = None
+
+    MEMORY_ACCOUNTING.disable()
 
     device = torch.device('cuda')
+    arch = Llama3Arch.llama3_8b()
+
+    print('loading original weights from %r' % (orig_dir,))
+    orig_state_dict = load_weights_safetensors_hf(orig_dir, arch)
+    orig_weights = CheckpointStateDict(orig_state_dict)
+
+    print('loading quantized weights from %r' % (quant_dir,))
+    quant_weights = QuantizedCheckpointLoader(quant_dir, dequant_device=device)
+
+    if lora_path is not None:
+        print('loading trained lora from %r' % (lora_path,))
+        lora_state_dict = torch.load(lora_path, weights_only=True)
+        lora_weights = CheckpointStateDict(lora_state_dict)
+    else:
+        lora_weights = None
+
+    tokenizer_json_path = os.path.join(orig_dir, 'tokenizer.json')
+    print('loading tokenizer from %s' % tokenizer_json_path)
+    tokenizer = llama3_tokenizer_transformers(tokenizer_json_path)
 
 
-    print('load original model from %r' % (dir_path,))
-
-    # The checkpointer always writes a config to its output directory.  We send
-    # that to a temporary directory that will be deleted automatically on exit.
-    with TemporaryDirectory() as checkpointer_output_dir:
-        checkpointer = FullModelHFCheckpointer(
-            checkpoint_dir=dir_path,
-            checkpoint_files=[f for f in os.listdir(dir_path) if f.endswith('.safetensors')],
-            model_type='LLAMA3',
-            output_dir=checkpointer_output_dir,
+    # Build llama3 model
+    rope = RotaryPositionalEmbeddings(
+        dim = arch.head_dim(),
+        max_seq_len = arch.max_seq_len,
+        base = arch.rope_base,
+    ).to(device)
+    def make_model(make_linear, make_embedding):
+        return QRF.TransformerDecoder(
+            tok_embeddings = make_embedding(),
+            layers = [
+                QRF.TransformerDecoderLayer(
+                    attn = QRF.CausalSelfAttention(
+                        embed_dim = arch.embed_dim,
+                        num_heads = arch.num_heads,
+                        num_kv_heads = arch.num_kv_heads,
+                        head_dim = arch.head_dim(),
+                        q_proj = make_linear(),
+                        k_proj = make_linear(),
+                        v_proj = make_linear(),
+                        output_proj = make_linear(),
+                        pos_embeddings = rope,
+                    ),
+                    mlp = QRF.FeedForward(
+                        gate_proj = make_linear(),
+                        down_proj = make_linear(),
+                        up_proj = make_linear(),
+                        activation = nn.SiLU(),
+                    ),
+                    sa_norm = QRF.RMSNorm(eps = arch.norm_eps),
+                    mlp_norm = QRF.RMSNorm(eps = arch.norm_eps),
+                ) for i in range(arch.num_layers)
+            ],
+            norm = QRF.RMSNorm(eps = arch.norm_eps),
+            output = make_linear(),
         )
-        checkpoint_dict = checkpointer.load_checkpoint()
-        del checkpointer
-    #print(sorted(checkpoint_dict.keys()))
-    #print(sorted(checkpoint_dict['model'].keys()))
+
+    model = make_model(QRF.Linear, QRF.Embedding)
+
+    def embedding_with_lora():
+        base = QRF.Embedding()
+        adapter = QRF.EmbeddingLowRankAdapter()
+        return QRF.WithAdapter(base, adapter)
+
+    def linear_with_lora():
+        base = QRF.Linear()
+        adapter = QRF.LowRankAdapter()
+        return QRF.WithAdapter(base, adapter)
+
+    model_with_lora = make_model(linear_with_lora, embedding_with_lora)
 
 
-    print('build model')
+    # Training config
+    max_seq_len = 1024
+    batch_size = 1
+    total_epochs = 1
+    max_steps_per_epoch = 2500
+    #max_steps_per_epoch = 2500
+    #max_steps_per_epoch = 1000
+    #max_steps_per_epoch = 2500
+    gradient_accumulation_steps = 8
 
-    model_orig = SlowTransformerDecoder(llama3_8b(), checkpoint_dict['model'])
-    model_orig = model_orig.to(device)
+    max_samples = gradient_accumulation_steps * max_steps_per_epoch
 
-    num_layers = 32
-
-
-    # Load alternate weights
-    print('load alternate weights')
-
-    alt_state_dict = checkpoint_dict['model'].copy()
-    for layer_index in range(num_layers):
-        layer_dir = os.path.join(dir_path, 'output', str(layer_index))
-        if not os.path.isdir(layer_dir):
-            continue
-        max_adapter_index = None
-        for f in os.listdir(layer_dir):
-            m = ADAPTER_FILE_NAME_REGEX.match(f)
-            if not m:
-                continue
-            idx = int(m.group(1))
-            if max_adapter_index is None or idx > max_adapter_index:
-                max_adapter_index = idx
-        if max_adapter_index is None:
-            continue
-        layer_path = os.path.join(layer_dir, 'adapter_%d.pt' % max_adapter_index)
-        print('  ' + layer_path)
-        layer_dict = torch.load(layer_path, weights_only=True, map_location='cpu')
-        print('layer', layer_index, sorted(layer_dict.keys()))
-        for key, value in layer_dict.items():
-            assert key in LAYER_PARAMETERS
-            alt_state_dict['layers.%d.%s' % (layer_index, key)] = value
+    #superbatch_mem_gb = 32
+    superbatch_mem_gb = 8
 
 
-    print('build alternate model')
+    # Test config
+    test_steps = 1000
 
-    from torchtune.utils._checkpointing._checkpointer_utils import load_gguf
-    gguf_dict = load_gguf(
-        os.path.join(dir_path, 'ggml-model-Q6_K.gguf'),
-        filter_name_prefix = 'dont_load_any_tensors',
+
+    # Set up dataset and loader
+    print('loading dataset')
+    sampler, dataloader = load_slimorca_dataset(
+        tokenizer=tokenizer,
+        max_seq_len=max_seq_len,
+        train_on_input=True,
+        seed=0,
+        batch_size=batch_size,
     )
-    quant_map = convert_weights.gguf_to_tune(gguf_dict['gguf_quant_map'])
-    #print(quant_map)
 
-    model_alt_base = llama3_8b()
-    quantized.replace_modules(model_alt_base, quant_map)
-    model_alt = SlowTransformerDecoder(model_alt_base, alt_state_dict)
-    model_alt = model_alt.to(device)
+    # Loss function
+    loss_fn = nn.KLDivLoss(log_target=True, reduction='batchmean')
 
+    MEMORY_ACCOUNTING.report('before testing loop')
 
-    print('load tokenizer')
-    tokenizer = llama3_tokenizer_transformers(os.path.join(dir_path, 'tokenizer.json'))
+    # Testing loop
 
+    # Match indentation of train_repair_lora_streaming.py
+    if True:
+        sampler.set_epoch(0)
 
-    print('test run')
-    tokens = tokenizer.encode('Hello, my name', add_eos=False)
-            #'<|start_header_id|>system<|end_header_id|>\n\n'
-            #'You are a helpful chatbot assistant.<|eot_id|>'
-            #'<|start_header_id|>user<|end_header_id|>\n\n'
-            #'Hello, my name is John.<|eot_id|>'
-            #'<|start_header_id|>assistant<|end_header_id|>\n\n',
-    print(tokens)
+        samples_iter = (tokens for tokens, labels in dataloader)
+        print('skipping %d samples' % max_samples)
+        samples_iter = itertools.islice(samples_iter, max_samples, max_samples + test_steps)
 
-    x_orig = model_orig.forward(torch.tensor([tokens], device=device, dtype=torch.int))
-    print(x_orig[0, -1])
-    print(top_tokens(tokenizer, x_orig, top_k=10))
-
-    x_alt = model_alt.forward(torch.tensor([tokens], device=device, dtype=torch.int))
-    print(x_alt[0, -1])
-    print(top_tokens(tokenizer, x_alt, top_k=10))
+        embeds_orig = SuperbatchEmbeddings(arch, ram_gb=superbatch_mem_gb // 2)
+        embeds_quant = SuperbatchEmbeddings(arch, ram_gb=superbatch_mem_gb // 2)
+        superbatch_limit = embeds_orig.tokens_free()
 
 
-    y_orig = torch.nn.functional.log_softmax(x_orig, dim=-1)
-    y_alt = torch.nn.functional.log_softmax(x_alt, dim=-1)
+        pbar_orig = tqdm(desc='orig', total=test_steps)
+        pbar_quant = tqdm(desc='quant', total=test_steps)
+        pbar_loss = tqdm(desc='loss', total=test_steps)
+        pbar_superbatch_forward = tqdm(desc='superbatch forward', total=2 + arch.num_layers)
+        pbar_superbatch_layer = tqdm(desc='superbatch layer', total=1)
 
-    kl_div_fn = torch.nn.KLDivLoss(log_target=True, reduction='batchmean')
-    kl_div = kl_div_fn(y_alt, y_orig)
-    print(kl_div)
+        loss_sum = 0.0
+        loss_count = 0
+        total_tokens = 0
+
+        for superbatch_samples in sized_chunks(samples_iter, superbatch_limit,
+                lambda t: t.numel()):
+            run_forward_superbatch2(
+                superbatch_samples,
+                embeds_orig,
+                arch.num_layers,
+                lambda: QRM.llama3.build_forward_tok_embeddings(model, orig_weights, device),
+                lambda i: QRM.llama3.build_forward_layer(model, orig_weights, i, device),
+                lambda: QRM.llama3.build_forward_norm(model, orig_weights, device),
+                device,
+                pbar_forward = pbar_superbatch_forward,
+                pbar_layer = pbar_superbatch_layer,
+            )
+            pbar_orig.update(len(superbatch_samples))
+
+            MEMORY_ACCOUNTING.report('after orig superbatch')
+
+            if lora_weights is None:
+                run_forward_superbatch2(
+                    superbatch_samples,
+                    embeds_quant,
+                    arch.num_layers,
+                    lambda: QRM.llama3.build_forward_tok_embeddings(model, quant_weights, device),
+                    lambda i: QRM.llama3.build_forward_layer(model, quant_weights, i, device),
+                    lambda: QRM.llama3.build_forward_norm(model, quant_weights, device),
+                    device,
+                    pbar_forward = pbar_superbatch_forward,
+                    pbar_layer = pbar_superbatch_layer,
+                )
+                pbar_quant.update(len(superbatch_samples))
+
+                m_quant = QRM.llama3.build_forward_output(model, quant_weights, device)
+            else:
+                assert False, 'TODO: implement lora'
+
+            MEMORY_ACCOUNTING.report('after quant superbatch')
+
+            m_orig = QRM.llama3.build_forward_output(model, orig_weights, device)
+
+            for i in range(len(superbatch_samples)):
+                orig_logits = m_orig(embeds_orig[i].to(device))
+                MEMORY_ACCOUNTING.register(orig_logits, 'orig_logits')
+                orig_log_prob = F.log_softmax(orig_logits, dim=-1)
+                MEMORY_ACCOUNTING.register(orig_log_prob, 'orig_log_prob')
+                orig_log_prob = orig_log_prob.view(-1, arch.vocab_size)
+                del orig_logits
+
+                quant_logits = m_quant(embeds_quant[i].to(device))
+                MEMORY_ACCOUNTING.register(quant_logits, 'quant_logits')
+                quant_log_prob = F.log_softmax(quant_logits, dim=-1)
+                MEMORY_ACCOUNTING.register(quant_log_prob, 'quant_log_prob')
+                quant_log_prob = quant_log_prob.view(-1, arch.vocab_size)
+                del quant_logits
+
+                loss = loss_fn(quant_log_prob, orig_log_prob)
+                MEMORY_ACCOUNTING.register(loss, 'loss')
+
+                loss_sum += loss.item()
+                loss_count += 1
+                total_tokens += superbatch_samples[i].numel()
+
+                del orig_log_prob, quant_log_prob, loss
+
+                pbar_loss.update()
+
+        pbar_orig.close()
+        pbar_quant.close()
+        pbar_loss.close()
+        pbar_superbatch_forward.close()
+        pbar_superbatch_layer.close()
+
+        print('\n\n%d total tokens' % total_tokens)
+        print('loss = %.6e' % (loss_sum / loss_count))
+
+    MEMORY_ACCOUNTING.report('after training loop')
 
 
-
-    #loss_fn = torch.nn.MSELoss()
-    #loss = loss_fn(x_orig, x_alt)
-    #print(loss)
-
+#    state_dict = {}
 #
-#    model_orig2 = llama3_8b().to(device)
-#    model_orig2.load_state_dict(checkpoint_dict['model'])
-#    print('test run2')
-#    print(model_orig2.forward(torch.tensor([[65, 66, 67]], device=device,
-#                                          dtype=torch.int)))
-
-
-    # Create model
-
-    #model_orig = llama3_8b()
-
-
-    # Load alternate layer weights
-
-    
-
+#    def save_low_rank_adapter_params(name, params):
+#        state_dict[name + '.lora_a'] = params.lora_a
+#        state_dict[name + '.lora_b'] = params.lora_b
+#
+#    def save_rms_norm_params(name ,params):
+#        state_dict[name + '.scale'] = params.scale
+#
+#    def save_layer_trainable_params(name, params):
+#        save_low_rank_adapter_params(name + '.q_proj', params.q_proj)
+#        save_low_rank_adapter_params(name + '.k_proj', params.k_proj)
+#        save_low_rank_adapter_params(name + '.v_proj', params.v_proj)
+#        save_low_rank_adapter_params(name + '.output_proj', params.output_proj)
+#        save_low_rank_adapter_params(name + '.gate_proj', params.gate_proj)
+#        save_low_rank_adapter_params(name + '.down_proj', params.down_proj)
+#        save_low_rank_adapter_params(name + '.up_proj', params.up_proj)
+#        save_rms_norm_params(name + '.sa_norm', params.sa_norm)
+#        save_rms_norm_params(name + '.mlp_norm', params.mlp_norm)
+#
+#    def save_trainable_params(name, params):
+#        save_low_rank_adapter_params(name + '.tok_embeddings', params.tok_embeddings)
+#        for i, layer_params in enumerate(params.layers):
+#            save_layer_trainable_params('%s.layers.%d' % (name, i), layer_params)
+#        save_rms_norm_params(name + '.norm', params.norm)
+#        save_low_rank_adapter_params(name + '.output', params.output)
+#
+#    save_trainable_params('params', train_params)
+#    checkpoint_path = os.path.join(quant_dir, 'repair_ckpt.pt')
+#    torch.save(state_dict, checkpoint_path)
+#    print('\n\nsaved %s' % checkpoint_path)
 
 
 if __name__ == '__main__':
