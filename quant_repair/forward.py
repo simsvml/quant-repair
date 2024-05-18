@@ -45,15 +45,19 @@ class SuperbatchEmbeddings:
         self._tokens_used = end
         self._batches.append(BatchInfo(shape, start))
 
-    def __getitem__(self, i: int) -> Tensor:
+    def __getitem__(self, i) -> Tensor:
         """
         Get the current embeddings for batch `i`.
         """
-        info = self._batches[i]
-        start = info.start
-        end = start + info.shape.numel()
-        batch = self._buffer[start:end, :]
-        return batch.view(info.shape + (self._embed_dim,))
+        if isinstance(i, slice):
+            start, stop, stride = i.indices(len(self))
+            return [self[j] for j in range(start, stop, stride)]
+        else:
+            info = self._batches[i]
+            start = info.start
+            end = start + info.shape.numel()
+            batch = self._buffer[start:end, :]
+            return batch.view(info.shape + (self._embed_dim,))
 
     def __iter__(self):
         for info in self._batches:

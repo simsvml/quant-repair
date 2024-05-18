@@ -268,6 +268,7 @@ class WithAdapter:
 class LowRankAdapterParams:
     lora_a: Tensor
     lora_b: Tensor
+    lora_alpha: float = 1.0
 
     def tensors(self):
         yield self.lora_a
@@ -278,13 +279,14 @@ class LowRankAdapter:
     def run(self, params: LowRankAdapterParams, x: Tensor) -> Tensor:
         x = F.linear(x, params.lora_a)
         x = F.linear(x, params.lora_b)
-        return x
+        return x * params.lora_alpha
     
 
 @dataclass(frozen=True)
 class EmbeddingLowRankAdapterParams:
     lora_a: Tensor
     lora_b: Tensor
+    lora_alpha: float = 1.0
 
     def tensors(self):
         yield self.lora_a
@@ -295,4 +297,4 @@ class EmbeddingLowRankAdapter:
     def run(self, params: EmbeddingLowRankAdapterParams, x: Tensor) -> Tensor:
         x = F.embedding(x, params.lora_a.t())
         x = F.linear(x, params.lora_b)
-        return x
+        return x * params.lora_alpha

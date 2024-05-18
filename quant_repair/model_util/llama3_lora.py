@@ -1,9 +1,80 @@
 from dataclasses import dataclass
-from typing import List, Callable
+from typing import Tuple, List, Callable
 from torch import Tensor
 from .. import functional as QRF
 from ..memory_accounting import MEMORY_ACCOUNTING
 from .misc import weights_getter
+
+
+@dataclass(frozen=True)
+class LayerLinearDimensions:
+    q_proj: Tuple[int, int]
+    k_proj: Tuple[int, int]
+    v_proj: Tuple[int, int]
+    output_proj: Tuple[int, int]
+    gate_proj: Tuple[int, int]
+    down_proj: Tuple[int, int]
+    up_proj: Tuple[int, int]
+
+    def get(self, key: str) -> Tuple[int, int]:
+        if key == 'attn.q_proj':
+            return self.q_proj
+        elif key == 'attn.k_proj':
+            return self.k_proj
+        elif key == 'attn.v_proj':
+            return self.v_proj
+        elif key == 'attn.output_proj':
+            return self.output_proj
+        elif key == 'mlp.w1':
+            return self.gate_proj
+        elif key == 'mlp.w2':
+            return self.down_proj
+        elif key == 'mlp.w3':
+            return self.up_proj
+        else:
+            raise KeyError(key)
+
+@dataclass(frozen=True)
+class LinearDimensions:
+    tok_embeddings: Tuple[int, int]
+    layers: List[LayerLinearDimensions]
+    output: Tuple[int, int]
+
+    def get(self, key: str) -> Tuple[int, int]:
+        if key.startswith('layers.'):
+            _, layer_index_str, rel_key = key.split('.', 2)
+            layer_index = int(layer_index_str)
+            return self.layers[layer_index].get(rel_key)
+
+        if key == 'tok_embeddings':
+            return self.tok_embeddings
+        elif key == 'output':
+            return self.output
+        else:
+            raise KeyError(key)
+
+def layer_linear_dimensions(arch) -> LayerLinearDimensions:
+    embed_dim = arch.embed_dim
+    num_heads = arch.num_heads
+    num_kv_heads = arch.num_kv_heads
+    head_dim = arch.head_dim()
+    hidden_dim = arch.hidden_dim()
+    return LayerLinearDimensions(
+        q_proj = (embed_dim, num_heads * head_dim),
+        k_proj = (embed_dim, num_kv_heads * head_dim),
+        v_proj = (embed_dim, num_kv_heads * head_dim),
+        output_proj = (embed_dim, embed_dim),
+        gate_proj = (embed_dim, hidden_dim),
+        down_proj = (hidden_dim, embed_dim),
+        up_proj = (embed_dim, hidden_dim),
+    )
+
+def linear_dimensions(arch) -> LinearDimensions:
+    return LinearDimensions(
+        tok_embeddings = (arch.vocab_size, arch.embed_dim),
+        layers = [layer_linear_dimensions(arch)] * arch.num_layers,
+        output = (arch.embed_dim, arch.vocab_size),
+    )
 
 
 @dataclass(frozen=True)

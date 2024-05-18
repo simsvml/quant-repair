@@ -11,7 +11,7 @@ def build_forward_tok_embeddings(
     device,
 ) -> Callable[[Tensor], Tensor]:
     get1 = weights_getter(loader, device)
-    params = QRF.LinearParams(get1('tok_embeddings.weight'))
+    params = QRF.EmbeddingParams(get1('tok_embeddings.weight'))
     MEMORY_ACCOUNTING.register_params(params, 'build_forward_tok_embeddings params')
     def run(x):
         return model.tok_embeddings.run(params, x)

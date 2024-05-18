@@ -93,15 +93,97 @@ def record_time(dest, key):
     end = time.time()
     dest[key] += end - start
 
-def main():
+def main1():
     with set_default_dtype(torch.bfloat16):
         #with torch.no_grad():
-            run()
+            run(None)
 
-def run():
-    assert len(sys.argv) == 3
+def main2():
+    configs = []
+
+    configs.append({
+        'lora_rank': 32,
+        'layer_lora_rank': [
+            16 if i < 14 else 64 if i >= 32 - 7 else 32
+            for i in range(32)
+        ],
+    })
+
+    for r in (64, 16, 8, 128):
+        configs.append({
+            'lora_rank': r,
+            'layer_lora_rank': [r] * 32,
+        })
+
+    with set_default_dtype(torch.bfloat16):
+        #with torch.no_grad():
+            for cfg in configs:
+                try:
+                    run(cfg)
+                except Exception as e:
+                    print('error: %s' % (e,))
+                    print('config = %r' % (cfg,))
+                    # Ensure the next run has a distinct timestamp, even if the
+                    # current run failed in under 1 second.
+                    time.sleep(2)
+
+def main3():
+    configs = []
+
+    def add(override_rank, lr_exponent):
+        configs.append(dict(
+            lr = 1e-6 * 2 ** lr_exponent,
+            override_rank = override_rank,
+        ))
+
+    add(None, 2)
+    add(None, 2.5)
+    add(None, 1.5)
+
+    add(32, 2.5)
+    add(32, 1.5)
+
+    add(None, 1)
+    add(None, 3)
+
+    #add(None, -1)
+    #add(None, 0)
+    #add(None, 1)
+    #add(None, 2)
+    #add(None, 3)
+    #add(None, 4)
+    #add(None, 5)
+
+    #add(32, -1)
+    #add(32, 0)
+    #add(32, 1)
+    #add(32, 2)
+    #add(32, 3)
+    #add(32, 4)
+    #add(32, 5)
+
+    #for override_rank in (None, 32):
+    #    for i in (-1, 0, 1, 2, 4, 5):
+
+    with set_default_dtype(torch.bfloat16):
+        #with torch.no_grad():
+            for cfg in configs:
+                try:
+                    run(cfg)
+                except Exception as e:
+                    print('error: %s' % (e,))
+                    print('config = %r' % (cfg,))
+                    # Ensure the next run has a distinct timestamp, even if the
+                    # current run failed in under 1 second.
+                    time.sleep(2)
+
+main = main3
+
+def run(cfg):
+    assert len(sys.argv) == 4
     orig_dir = sys.argv[1]
     quant_dir = sys.argv[2]
+    rank_map_path = sys.argv[3]
 
     MEMORY_ACCOUNTING.disable()
 
@@ -176,18 +258,40 @@ def run():
     # Norm scales are initialized from the base model's weights.  LoRA
     # parameters are initialized to default values.
 
-    lora_rank = 32
+    #lora_rank = 64
+    lora_alpha = 32
+
+    #layer_lora_rank = []
+    #for i in range(arch.num_layers):
+    #    #if i < 14:
+    #    #    layer_lora_rank.append(lora_rank // 2)
+    #    #elif i >= arch.num_layers - 7:
+    #    #    layer_lora_rank.append(lora_rank * 2)
+    #    #else:
+    #    #    layer_lora_rank.append(lora_rank)
+    #    layer_lora_rank.append(lora_rank)
+
+    #lora_rank = cfg['lora_rank']
+    #layer_lora_rank = cfg['layer_lora_rank']
+
+    dims = QRM.llama3_lora.linear_dimensions(arch)
+    rank_map = json.load(open(rank_map_path))
+
+    if cfg['override_rank'] is not None:
+        for key in rank_map:
+            rank_map[key] = cfg['override_rank']
 
     def init_lora_params(
-        in_features: int,
-        out_features: int,
-        rank: int = lora_rank,
+        key: str,
         # TODO: Try float16 for easier llama.cpp compat
         dtype: torch.dtype = torch.bfloat16,
     ) -> QRF.LowRankAdapterParams:
+        n, m = dims.get(key)
+        rank = rank_map[key]
         return QRF.LowRankAdapterParams(
-            lora_a = torch.empty((rank, in_features), dtype=dtype, device=device).normal_(),
-            lora_b = torch.zeros((out_features, rank), dtype=dtype, device=device),
+            lora_a = torch.empty((rank, n), dtype=dtype, device=device).normal_(),
+            lora_b = torch.zeros((m, rank), dtype=dtype, device=device),
+            lora_alpha = lora_alpha / rank,
         )
 
     def init_layer_params(layer_index: int) -> LayerTrainableParams:
@@ -200,13 +304,13 @@ def run():
         get1 = weights_getter(quant_weights, device)
 
         return LayerTrainableParams(
-            q_proj = init_lora_params(embed_dim, num_heads * head_dim),
-            k_proj = init_lora_params(embed_dim, num_kv_heads * head_dim),
-            v_proj = init_lora_params(embed_dim, num_kv_heads * head_dim),
-            output_proj = init_lora_params(embed_dim, embed_dim),
-            gate_proj = init_lora_params(embed_dim, hidden_dim),
-            down_proj = init_lora_params(hidden_dim, embed_dim),
-            up_proj = init_lora_params(embed_dim, hidden_dim),
+            q_proj = init_lora_params('layers.%d.attn.q_proj' % layer_index),
+            k_proj = init_lora_params('layers.%d.attn.k_proj' % layer_index),
+            v_proj = init_lora_params('layers.%d.attn.v_proj' % layer_index),
+            output_proj = init_lora_params('layers.%d.attn.output_proj' % layer_index),
+            gate_proj = init_lora_params('layers.%d.mlp.w1' % layer_index),
+            down_proj = init_lora_params('layers.%d.mlp.w2' % layer_index),
+            up_proj = init_lora_params('layers.%d.mlp.w3' % layer_index),
             sa_norm = QRF.RMSNormParams(
                 get1('layers.%d.sa_norm.scale' % layer_index).to(torch.bfloat16)),
             mlp_norm = QRF.RMSNormParams(
@@ -216,10 +320,10 @@ def run():
     def init_train_params() -> TrainableParams:
         get1 = weights_getter(quant_weights, device)
         return TrainableParams(
-            tok_embeddings = init_lora_params(arch.vocab_size, arch.embed_dim),
+            tok_embeddings = init_lora_params('tok_embeddings'),
             layers = [init_layer_params(i) for i in range(arch.num_layers)],
             norm = QRF.RMSNormParams(get1('norm.scale').to(torch.bfloat16)),
-            output = init_lora_params(arch.embed_dim, arch.vocab_size),
+            output = init_lora_params('output'),
         )
 
     train_params = init_train_params()
@@ -233,7 +337,7 @@ def run():
     max_seq_len = 1024
     batch_size = 1
     total_epochs = 1
-    max_steps_per_epoch = 8500
+    max_steps_per_epoch = 1000
     #max_steps_per_epoch = 2500
     #max_steps_per_epoch = 1000
     #max_steps_per_epoch = 2500
@@ -269,9 +373,9 @@ def run():
 
     optimizer = torch.optim.AdamW(
         list(train_params.tensors()),
-        lr = 8e-6,
-        weight_decay = 0.01,
-        #weight_decay = 0,
+        lr = cfg['lr'],
+        #weight_decay = 0.01,
+        weight_decay = 0,
     )
 #    lr_scheduler = lr_schedulers.get_cosine_schedule_with_warmup(
 #        optimizer,
@@ -332,7 +436,8 @@ def run():
     # Training loop
     print('training %d parameter tensors' % (len(list(train_params.tensors()))))
 
-    log_file = open('train_%d.log' % time.time(), 'w')
+    timestamp = time.strftime('%Y%m%d-%H%M%S')
+    log_file = open('train_%s.log' % timestamp, 'w')
     def write_log(obj):
         json.dump(obj, log_file)
         log_file.write('\n')
@@ -346,6 +451,8 @@ def run():
         'lr': optimizer.defaults['lr'],
         'weight_decay': optimizer.defaults['weight_decay'],
         'scheduler': str(lr_scheduler),
+        'lora_alpha': lora_alpha,
+        'lora_rank_map': rank_map,
     }
     if isinstance(lr_scheduler, torch.optim.lr_scheduler.LambdaLR):
         config_dict['lr_lambdas'] = [str(l) for l in lr_scheduler.lr_lambdas]
@@ -539,6 +646,7 @@ def run():
     def save_low_rank_adapter_params(name, params):
         state_dict[name + '.lora_a'] = params.lora_a
         state_dict[name + '.lora_b'] = params.lora_b
+        state_dict[name + '.lora_alpha'] = params.lora_alpha
 
     def save_rms_norm_params(name ,params):
         state_dict[name + '.scale'] = params.scale
@@ -562,7 +670,7 @@ def run():
         save_low_rank_adapter_params(name + '.output', params.output)
 
     save_trainable_params('params', train_params)
-    checkpoint_path = os.path.join(quant_dir, 'repair_ckpt.pt')
+    checkpoint_path = os.path.join(quant_dir, 'repair_ckpt_%s.pt' % timestamp)
     torch.save(state_dict, checkpoint_path)
     print('\n\nsaved %s' % checkpoint_path)
 
