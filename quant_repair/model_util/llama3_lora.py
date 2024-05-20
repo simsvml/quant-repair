@@ -115,6 +115,48 @@ class TrainableParams:
         yield from self.output.tensors()
 
 
+def load_trainable_params(loader, num_layers, device) -> TrainableParams:
+    get1 = weights_getter(loader, device)
+
+    def load_low_rank_adapter_params(name) -> QRF.LowRankAdapterParams:
+        return QRF.LowRankAdapterParams(
+            lora_a = get1(name + '.lora_a'),
+            lora_b = get1(name + '.lora_b'),
+            lora_alpha = loader.get(name + '.lora_alpha', 'x')['x'],
+        )
+
+    def load_rms_norm_params(name) -> QRF.RMSNormParams:
+        return QRF.RMSNormParams(
+            scale = get1(name + '.scale'),
+        )
+
+    def load_layer_trainable_params(name):
+        return LayerTrainableParams(
+            q_proj = load_low_rank_adapter_params(name + '.q_proj'),
+            k_proj = load_low_rank_adapter_params(name + '.k_proj'),
+            v_proj = load_low_rank_adapter_params(name + '.v_proj'),
+            output_proj = load_low_rank_adapter_params(name + '.output_proj'),
+            gate_proj = load_low_rank_adapter_params(name + '.gate_proj'),
+            down_proj = load_low_rank_adapter_params(name + '.down_proj'),
+            up_proj = load_low_rank_adapter_params(name + '.up_proj'),
+            sa_norm = load_rms_norm_params(name + '.sa_norm'),
+            mlp_norm = load_rms_norm_params(name + '.mlp_norm'),
+        )
+
+    def load_trainable_params(name) -> TrainableParams:
+        return TrainableParams(
+            tok_embeddings = load_low_rank_adapter_params(name + '.tok_embeddings'),
+            layers = [
+                load_layer_trainable_params('%s.layers.%d' % (name, i))
+                for i in range(num_layers)
+            ],
+            norm = load_rms_norm_params(name + '.norm'),
+            output = load_low_rank_adapter_params(name + '.output'),
+        )
+
+    return load_trainable_params('params')
+
+
 def build_trainable_tok_embeddings(
     model: QRF.TransformerDecoder,
     loader,

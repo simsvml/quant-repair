@@ -22,7 +22,7 @@ from torchtune.utils import set_default_dtype
 from gguf import GGMLQuantizationType
 from quant_repair.architecture import Llama3Arch
 from quant_repair.common import build_module, load_weights, init_lora_weights
-from quant_repair.datasets import load_slimorca_dataset
+from quant_repair.datasets import load_slimorca_dataset, load_wikitext_dataset
 from quant_repair.forward import SuperbatchEmbeddings, sized_chunks
 from quant_repair import functional as QRF
 from quant_repair.memory_accounting import MEMORY_ACCOUNTING
@@ -66,8 +66,11 @@ def run():
         print('loading trained lora from %r' % (lora_path,))
         lora_state_dict = torch.load(lora_path, weights_only=True)
         lora_weights = CheckpointStateDict(lora_state_dict)
+        lora_params = QRM.llama3_lora.load_trainable_params(
+            lora_weights, arch.num_layers, device)
     else:
         lora_weights = None
+        lora_params = None
 
     tokenizer_json_path = os.path.join(orig_dir, 'tokenizer.json')
     print('loading tokenizer from %s' % tokenizer_json_path)
@@ -129,11 +132,11 @@ def run():
     max_seq_len = 1024
     batch_size = 1
     total_epochs = 1
-    max_steps_per_epoch = 2500
+    max_steps_per_epoch = 9000
     #max_steps_per_epoch = 2500
     #max_steps_per_epoch = 1000
     #max_steps_per_epoch = 2500
-    gradient_accumulation_steps = 8
+    gradient_accumulation_steps = 16
 
     max_samples = gradient_accumulation_steps * max_steps_per_epoch
 
@@ -142,7 +145,7 @@ def run():
 
 
     # Test config
-    test_steps = 1000
+    test_steps = 300
 
 
     # Set up dataset and loader
@@ -154,6 +157,12 @@ def run():
         seed=0,
         batch_size=batch_size,
     )
+    #sampler, dataloader = load_wikitext_dataset(
+    #    tokenizer = tokenizer,
+    #    max_seq_len = max_seq_len,
+    #    seed = 0,
+    #    batch_size = batch_size,
+    #)
 
     # Loss function
     loss_fn = nn.KLDivLoss(log_target=True, reduction='batchmean')
@@ -170,8 +179,8 @@ def run():
         print('skipping %d samples' % max_samples)
         samples_iter = itertools.islice(samples_iter, max_samples, max_samples + test_steps)
 
-        embeds_orig = SuperbatchEmbeddings(arch, ram_gb=superbatch_mem_gb // 2)
-        embeds_quant = SuperbatchEmbeddings(arch, ram_gb=superbatch_mem_gb // 2)
+        embeds_orig = SuperbatchEmbeddings(arch, ram_gb=superbatch_mem_gb / 2)
+        embeds_quant = SuperbatchEmbeddings(arch, ram_gb=superbatch_mem_gb / 2)
         superbatch_limit = embeds_orig.tokens_free()
 
 
@@ -202,7 +211,7 @@ def run():
 
             MEMORY_ACCOUNTING.report('after orig superbatch')
 
-            if lora_weights is None:
+            if lora_params is None:
                 run_forward_superbatch2(
                     superbatch_samples,
                     embeds_quant,
@@ -218,7 +227,24 @@ def run():
 
                 m_quant = QRM.llama3.build_forward_output(model, quant_weights, device)
             else:
-                assert False, 'TODO: implement lora'
+                run_forward_superbatch2(
+                    superbatch_samples,
+                    embeds_quant,
+                    arch.num_layers,
+                    lambda: QRM.llama3_lora.build_trainable_tok_embeddings(
+                        model_with_lora, quant_weights, lora_params, device),
+                    lambda i: QRM.llama3_lora.build_trainable_layer(
+                        model_with_lora, quant_weights, lora_params, i, device),
+                    lambda: QRM.llama3_lora.build_trainable_norm(
+                        model_with_lora, quant_weights, lora_params, device),
+                    device,
+                    pbar_forward = pbar_superbatch_forward,
+                    pbar_layer = pbar_superbatch_layer,
+                )
+                pbar_quant.update(len(superbatch_samples))
+
+                m_quant = QRM.llama3_lora.build_trainable_output(
+                    model_with_lora, quant_weights, lora_params, device)
 
             MEMORY_ACCOUNTING.report('after quant superbatch')
 

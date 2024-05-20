@@ -50,6 +50,10 @@ def run_forward_superbatch2(
     at a time.
     """
     embeds.clear()
+
+    if len(samples) == 0:
+        return
+
     if pbar_forward is not None:
         pbar_forward.reset(2 + num_layers)
 

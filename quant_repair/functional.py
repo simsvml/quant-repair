@@ -276,9 +276,20 @@ class LowRankAdapterParams:
 
 @dataclass(frozen=True)
 class LowRankAdapter:
+    dropout: float = 0.0
+
     def run(self, params: LowRankAdapterParams, x: Tensor) -> Tensor:
+        if self.dropout != 0.0:
+            x = F.dropout(x, self.dropout)
         x = F.linear(x, params.lora_a)
         x = F.linear(x, params.lora_b)
+        # https://arxiv.org/abs/2404.09610 "LoRA Dropout as a Sparsity
+        # Regularizer for Overfitting Control" drops rows and columns in both A
+        # and B, along the non-rank dimension only (to avoid reducing rank).
+        # This is equivalent to applying dropout to both the input and output
+        # vectors.
+        if self.dropout != 0.0:
+            x = F.dropout(x, self.dropout)
         return x * params.lora_alpha
     
 
@@ -294,7 +305,11 @@ class EmbeddingLowRankAdapterParams:
 
 @dataclass(frozen=True)
 class EmbeddingLowRankAdapter:
+    dropout: float = 0.0
+
     def run(self, params: EmbeddingLowRankAdapterParams, x: Tensor) -> Tensor:
         x = F.embedding(x, params.lora_a.t())
         x = F.linear(x, params.lora_b)
+        if self.dropout != 0.0:
+            x = F.dropout(x, self.dropout)
         return x * params.lora_alpha

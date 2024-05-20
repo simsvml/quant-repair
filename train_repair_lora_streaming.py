@@ -130,21 +130,53 @@ def main2():
 def main3():
     configs = []
 
-    def add(override_rank, lr_exponent):
+    def add(override_rank, lr_exponent = None, *, lr = None):
         configs.append(dict(
-            lr = 1e-6 * 2 ** lr_exponent,
+            lr = lr or (1e-6 * 2 ** lr_exponent),
             override_rank = override_rank,
         ))
 
-    add(None, 2)
-    add(None, 2.5)
-    add(None, 1.5)
+    #add(32, lr = 1e-4)
+    #add(32, lr = 1e-3)
+    #add(32, lr = 1e-5)
+    #add(32, lr = 1e-6)
 
-    add(32, 2.5)
-    add(32, 1.5)
+    #add(32, lr = 1e-6 * 10**0.25)
+    #add(32, lr = 1e-6 * 10**0.50)
+    #add(32, lr = 1e-6 * 10**0.75)
 
-    add(None, 1)
-    add(None, 3)
+    #add(32, lr = 1e-5 * 10**0.25)
+    #add(32, lr = 1e-5 * 10**0.50)
+    #add(32, lr = 1e-5 * 10**0.75)
+
+    #add(32, lr = 1e-5 * 10**(-1/8))
+    #add(32, lr = 1e-5)
+    #add(32, lr = 1e-5 * 10**(+1/8))
+
+    #add(32, lr = 1e-5 * 10**(+2/8))
+    #add(32, lr = 1e-5 * 10**(+3/8))
+
+    #add(None, lr = 1e-5 * 10**(-3/8))
+    #add(None, lr = 1e-5 * 10**(-1/8))
+    #add(None, lr = 1e-5 * 10**(+1/8))
+    #add(None, lr = 1e-5 * 10**(+3/8))
+
+    #add(None, lr = 1.2e-5)
+    #add(32, lr = 1.2e-5)
+
+    add(32, lr = 1.27e-5)
+    #add(64, lr = 1.27e-5)
+    #add(128, lr = 1.27e-5)
+
+    #add(None, 2)
+    #add(None, 2.5)
+    #add(None, 1.5)
+
+    #add(32, 2.5)
+    #add(32, 1.5)
+
+    #add(None, 1)
+    #add(None, 3)
 
     #add(None, -1)
     #add(None, 0)
@@ -167,19 +199,14 @@ def main3():
 
     with set_default_dtype(torch.bfloat16):
         #with torch.no_grad():
-            for cfg in configs:
-                try:
-                    run(cfg)
-                except Exception as e:
-                    print('error: %s' % (e,))
-                    print('config = %r' % (cfg,))
-                    # Ensure the next run has a distinct timestamp, even if the
-                    # current run failed in under 1 second.
-                    time.sleep(2)
+            run(configs)
 
 main = main3
 
-def run(cfg):
+def run(cfgs):
+    if isinstance(cfgs, (dict, type(None))):
+        cfgs = [cfgs]
+
     assert len(sys.argv) == 4
     orig_dir = sys.argv[1]
     quant_dir = sys.argv[2]
@@ -240,39 +267,285 @@ def run(cfg):
 
     model = make_model(QRF.Linear, QRF.Embedding)
 
+    #lora_dropout = 0.05
+    lora_dropout = 0.0
+
     def embedding_with_lora():
         base = QRF.Embedding()
-        adapter = QRF.EmbeddingLowRankAdapter()
+        adapter = QRF.EmbeddingLowRankAdapter(dropout = lora_dropout)
         return QRF.WithAdapter(base, adapter)
 
     def linear_with_lora():
         base = QRF.Linear()
-        adapter = QRF.LowRankAdapter()
+        adapter = QRF.LowRankAdapter(dropout = lora_dropout)
         return QRF.WithAdapter(base, adapter)
 
     model_with_lora = make_model(linear_with_lora, embedding_with_lora)
 
+
+    # Training config
+    max_seq_len = 1024
+    batch_size = 1
+    total_epochs = 1
+    #max_steps_per_epoch = 1000
+    #max_steps_per_epoch = 1000
+    #max_steps_per_epoch = 3500      # slimorca: 20M tokens
+    max_steps_per_epoch = 9000      # slimorca: 50M tokens
+    #max_steps_per_epoch = 18000     # slimorca: 100M tokens
+    #max_steps_per_epoch = 2500
+    gradient_accumulation_steps = 16
+
+    max_samples = gradient_accumulation_steps * max_steps_per_epoch
+
+    #superbatch_mem_gb = 32
+    superbatch_mem_gb = 8
+
+    # Set up dataset and loader
+    print('loading dataset')
+    sampler, dataloader = load_slimorca_dataset(
+        tokenizer=tokenizer,
+        max_seq_len=max_seq_len,
+        train_on_input=True,
+        seed=0,
+        batch_size=batch_size,
+    )
+
+
+    # Offload setup
+    print('loading quantized weights for offload')
+    offload = TensorOffload(device, vram_limit_gb=8)
+
+    offload.add_group('tok_embeddings')
+    for i in range(arch.num_layers):
+        offload.add_group('layers.%d' % i)
+    offload.add_group('norm')
+    offload.add_group('output')
+
+    def offload_init_tensors():
+        get1 = weights_getter(quant_weights, 'cpu')
+        def add_weight(group, name):
+            full_name = '%s.%s' % (group, name)
+            offload.add_tensor(group, full_name, get1(full_name), read_only=True)
+
+        add_weight('tok_embeddings', 'weight')
+        for i in range(arch.num_layers):
+            add_weight('layers.%d' % i, 'attn.q_proj.weight')
+            add_weight('layers.%d' % i, 'attn.k_proj.weight')
+            add_weight('layers.%d' % i, 'attn.v_proj.weight')
+            add_weight('layers.%d' % i, 'attn.output_proj.weight')
+            add_weight('layers.%d' % i, 'mlp.w1.weight')
+            add_weight('layers.%d' % i, 'mlp.w2.weight')
+            add_weight('layers.%d' % i, 'mlp.w3.weight')
+            add_weight('layers.%d' % i, 'sa_norm.scale')
+            add_weight('layers.%d' % i, 'mlp_norm.scale')
+        add_weight('norm', 'scale')
+        add_weight('output', 'weight')
+    offload_init_tensors()
+
+    offload.build_partitions()
+
+    # Use `offload` for fetching base model weights.
+    quant_weights = offload
+
+
+    MEMORY_ACCOUNTING.report('before training loop')
+
+
+    timestamp = time.strftime('%Y%m%d_%H%M%S')
+
+
+    global_config_dict = {
+        'max_seq_len': max_seq_len,
+        'batch_size': batch_size,
+        'total_epochs': total_epochs,
+        'max_steps_per_epoch': max_steps_per_epoch,
+        'gradient_accumulation_steps': gradient_accumulation_steps,
+        'lora_dropout': lora_dropout,
+        'lora_dropout_fixed': True,
+    }
+
+    def open_log(path):
+        log_file = open(path, 'w')
+        def write_log(obj):
+            json.dump(obj, log_file)
+            log_file.write('\n')
+            log_file.flush()
+        write_log(global_config_dict)
+        return write_log
+
+    coroutines = []
+    write_log_funcs = []
+    for i, cfg in enumerate(cfgs):
+        ident = '%s_%d' % (timestamp, i)
+        write_log = open_log('train_%s.log' % ident)
+
+        coroutine = train(
+            cfg = cfg,
+            device = device,
+            arch = arch,
+            rank_map_path = rank_map_path,
+            quant_weights = quant_weights,
+            write_log = write_log,
+            model_with_lora = model_with_lora,
+            num_training_steps = total_epochs * max_steps_per_epoch,
+            ident = ident,
+            output_dir = quant_dir,
+        )
+        coroutines.append(coroutine)
+        write_log_funcs.append(write_log)
+
+    def send_all(x):
+        for coroutine in coroutines:
+            coroutine.send(x)
+
+    def write_all_logs(x):
+        for write_log in write_log_funcs:
+            write_log(x)
+
+    # Start all coroutines
+    send_all(None)
+
+
+    # Training loop
+
+    for curr_epoch in range(total_epochs):
+        # Update the sampler to ensure data is correctly shuffled across epochs
+        # in case shuffle is True
+        sampler.set_epoch(curr_epoch)
+
+        samples_iter = (tokens for tokens, labels in dataloader)
+        samples_iter = itertools.islice(samples_iter, max_samples)
+
+        embeds_orig = SuperbatchEmbeddings(arch, ram_gb=superbatch_mem_gb)
+        superbatch_limit = embeds_orig.tokens_free()
+
+
+        pbar_samples = tqdm(desc='samples', total=max_samples, smoothing=0)
+        pbar_superbatch = tqdm(desc='superbatch', total=max_samples)
+        pbar_superbatch_forward = tqdm(desc='superbatch forward', total=2 + arch.num_layers)
+        pbar_superbatch_layer = tqdm(desc='superbatch layer', total=1)
+        pbar_train_forward = tqdm(desc='train forward', total=1)
+        pbar_train_backward = tqdm(desc='train backward', total=1)
+
+        total_tokens = 0
+
+        for superbatch_samples in sized_chunks(samples_iter, superbatch_limit,
+                lambda t: t.numel()):
+            run_forward_superbatch(
+                model,
+                orig_weights,
+                superbatch_samples,
+                embeds_orig,
+                device,
+                pbar_forward = pbar_superbatch_forward,
+                pbar_layer = pbar_superbatch_layer,
+            )
+            pbar_superbatch.update(len(superbatch_samples))
+
+            MEMORY_ACCOUNTING.report('after forward superbatch')
+
+            # Train using the collected embeddings.
+            for samples_start in range(0, len(superbatch_samples), gradient_accumulation_steps):
+                samples = superbatch_samples[samples_start :
+                    samples_start + gradient_accumulation_steps]
+                samples = [t.to(device).requires_grad_(False) for t in samples]
+                MEMORY_ACCOUNTING.register_all(samples, 'samples')
+
+                # (1) Distribute samples
+                send_all(samples)
+
+                pbar_train_forward.reset(2 + arch.num_layers)
+                pbar_train_backward.reset(1 + 2 + arch.num_layers)
+
+                with torch.no_grad():
+                    for i in range(2 + arch.num_layers):
+                        # (2) Forward pass steps
+                        send_all(None)
+                        pbar_train_forward.update()
+
+                MEMORY_ACCOUNTING.report('after train forward pass')
+
+                # Run loss forward and backward
+                m_orig = QRM.llama3.build_forward_output(model, orig_weights, device)
+
+                # (3) Before backward pass
+                send_all(None)
+
+                for i in range(len(samples)):
+                    orig_logits = m_orig(embeds_orig[samples_start + i].to(device))
+                    MEMORY_ACCOUNTING.register(orig_logits, 'orig_logits')
+                    orig_log_prob = F.log_softmax(orig_logits, dim=-1)
+                    MEMORY_ACCOUNTING.register(orig_log_prob, 'orig_log_prob')
+                    orig_log_prob = orig_log_prob.view(-1, arch.vocab_size)
+                    del orig_logits
+
+                    # (4) Distribute orig_log_prob for each sample
+                    send_all(orig_log_prob)
+                    del orig_log_prob
+
+                # Run remaining backward steps.
+                for i in range(2 + arch.num_layers):
+                    # (5) Remaining backward pass steps
+                    send_all(None)
+                    pbar_train_backward.update()
+
+                MEMORY_ACCOUNTING.report('after train backward pass')
+
+                # (6) Run optimizer
+                send_all(None)
+
+                pbar_samples.update(len(samples))
+                total_tokens += sum(x.numel() for x in samples)
+
+
+        pbar_samples.close()
+        pbar_superbatch.close()
+        pbar_superbatch_forward.close()
+        pbar_superbatch_layer.close()
+        pbar_train_forward.close()
+        pbar_train_backward.close()
+
+        print('trained on %d tokens' % total_tokens)
+        write_all_logs({
+            'epoch': curr_epoch,
+            'total_tokens': total_tokens,
+        })
+
+    MEMORY_ACCOUNTING.report('after training loop')
+
+    # (1) Distribute `None` to break out of each coroutine's training loop.
+    try:
+        send_all(None)
+    except StopIteration:
+        pass
+
+
+
+def train(
+    *,
+    cfg,
+    device,
+    arch,
+    rank_map_path,
+    quant_weights,
+    write_log,
+    model_with_lora,
+    num_training_steps,
+    ident,
+    output_dir,
+):
+    """
+    This is a coroutine that `yield`s before every forward and backward step of
+    the training loop.  This allows training multiple LoRA configurations
+    concurrently using the same data and base weights.
+    """
 
     print('initializing trainable parameters')
 
     # Norm scales are initialized from the base model's weights.  LoRA
     # parameters are initialized to default values.
 
-    #lora_rank = 64
-    lora_alpha = 32
-
-    #layer_lora_rank = []
-    #for i in range(arch.num_layers):
-    #    #if i < 14:
-    #    #    layer_lora_rank.append(lora_rank // 2)
-    #    #elif i >= arch.num_layers - 7:
-    #    #    layer_lora_rank.append(lora_rank * 2)
-    #    #else:
-    #    #    layer_lora_rank.append(lora_rank)
-    #    layer_lora_rank.append(lora_rank)
-
-    #lora_rank = cfg['lora_rank']
-    #layer_lora_rank = cfg['layer_lora_rank']
+    lora_alpha = 8
 
     dims = QRM.llama3_lora.linear_dimensions(arch)
     rank_map = json.load(open(rank_map_path))
@@ -333,121 +606,29 @@ def run(cfg):
         tensor.requires_grad_(True)
 
 
-    # Training config
-    max_seq_len = 1024
-    batch_size = 1
-    total_epochs = 1
-    max_steps_per_epoch = 1000
-    #max_steps_per_epoch = 2500
-    #max_steps_per_epoch = 1000
-    #max_steps_per_epoch = 2500
-    gradient_accumulation_steps = 16
-
-    max_samples = gradient_accumulation_steps * max_steps_per_epoch
-
-    #superbatch_mem_gb = 32
-    superbatch_mem_gb = 8
-
-    # Set up dataset and loader
-    print('loading dataset')
-    sampler, dataloader = load_slimorca_dataset(
-        tokenizer=tokenizer,
-        max_seq_len=max_seq_len,
-        train_on_input=True,
-        seed=0,
-        batch_size=batch_size,
-    )
-
     # Optimizer, learning rate schedule, and loss function
-
-#    optimizer = torch.optim.AdamW(
-#        list(train_params.tensors()),
-#        lr = 2.5e-6,
-#    )
-#    lr_scheduler = lr_schedulers.get_exponential_schedule(
-#        optimizer,
-#        start_factor = 1.0,
-#        end_factor = 0.1,
-#        num_training_steps = total_epochs * max_steps_per_epoch,
-#    )
-
     optimizer = torch.optim.AdamW(
         list(train_params.tensors()),
         lr = cfg['lr'],
-        #weight_decay = 0.01,
         weight_decay = 0,
     )
-#    lr_scheduler = lr_schedulers.get_cosine_schedule_with_warmup(
-#        optimizer,
-#        num_warmup_steps = 100,
-#        num_training_steps = total_epochs * max_steps_per_epoch,
-#    )
-    lr_scheduler = lr_schedulers.get_linear_schedule(
+    lr_scheduler = lr_schedulers.get_cosine_schedule_with_warmup(
         optimizer,
-        start_factor = 1.0,
-        end_factor = 0.1,
-        num_training_steps = total_epochs * max_steps_per_epoch,
+        num_warmup_steps = num_training_steps // 10,
+        num_training_steps = num_training_steps,
     )
-
-    loss_fn = nn.MSELoss()
+    #lr_scheduler = lr_schedulers.get_linear_schedule(
+    #    optimizer,
+    #    start_factor = 1.0,
+    #    end_factor = 0.1,
+    #    num_training_steps = num_training_steps,
+    #)
     kl_div_loss_fn = nn.KLDivLoss(log_target=True, reduction='batchmean')
 
 
-    # Offload setup
-    print('loading quantized weights for offload')
-    offload = TensorOffload(device, vram_limit_gb=8)
-
-    offload.add_group('tok_embeddings')
-    for i in range(arch.num_layers):
-        offload.add_group('layers.%d' % i)
-    offload.add_group('norm')
-    offload.add_group('output')
-
-    def offload_init_tensors():
-        get1 = weights_getter(quant_weights, 'cpu')
-        def add_weight(group, name):
-            full_name = '%s.%s' % (group, name)
-            offload.add_tensor(group, full_name, get1(full_name), read_only=True)
-
-        add_weight('tok_embeddings', 'weight')
-        for i in range(arch.num_layers):
-            add_weight('layers.%d' % i, 'attn.q_proj.weight')
-            add_weight('layers.%d' % i, 'attn.k_proj.weight')
-            add_weight('layers.%d' % i, 'attn.v_proj.weight')
-            add_weight('layers.%d' % i, 'attn.output_proj.weight')
-            add_weight('layers.%d' % i, 'mlp.w1.weight')
-            add_weight('layers.%d' % i, 'mlp.w2.weight')
-            add_weight('layers.%d' % i, 'mlp.w3.weight')
-            add_weight('layers.%d' % i, 'sa_norm.scale')
-            add_weight('layers.%d' % i, 'mlp_norm.scale')
-        add_weight('norm', 'scale')
-        add_weight('output', 'weight')
-    offload_init_tensors()
-
-    offload.build_partitions()
-
-    # Use `offload` for fetching base model weights.
-    quant_weights = offload
-
-
-    MEMORY_ACCOUNTING.report('before training loop')
-
-
-    # Training loop
-    print('training %d parameter tensors' % (len(list(train_params.tensors()))))
-
-    timestamp = time.strftime('%Y%m%d-%H%M%S')
-    log_file = open('train_%s.log' % timestamp, 'w')
-    def write_log(obj):
-        json.dump(obj, log_file)
-        log_file.write('\n')
-        log_file.flush()
+    # Write config to log
     config_dict = {
-        'max_seq_len': max_seq_len,
-        'batch_size': batch_size,
-        'total_epochs': total_epochs,
-        'max_steps_per_epoch': max_steps_per_epoch,
-        'gradient_accumulation_steps': gradient_accumulation_steps,
+        'num_training_steps': num_training_steps,
         'lr': optimizer.defaults['lr'],
         'weight_decay': optimizer.defaults['weight_decay'],
         'scheduler': str(lr_scheduler),
@@ -458,187 +639,123 @@ def run(cfg):
         config_dict['lr_lambdas'] = [str(l) for l in lr_scheduler.lr_lambdas]
     write_log(config_dict)
 
+
     metrics = {
-        'quant_time': 0.,
-        'orig_time': 0.,
-        'train_time': 0.,
-        'opt_time': 0.,
         'loss': None,
         'lr': None,
         'gpu_resources': None,
     }
-    for curr_epoch in range(total_epochs):
-        # Update the sampler to ensure data is correctly shuffled across epochs
-        # in case shuffle is True
-        sampler.set_epoch(curr_epoch)
 
-        samples_iter = (tokens for tokens, labels in dataloader)
-        samples_iter = itertools.islice(samples_iter, max_samples)
+    while True:
+        # (1) Receive samples
+        samples = yield
+        if samples is None:
+            break
 
-        embeds_orig = SuperbatchEmbeddings(arch, ram_gb=superbatch_mem_gb)
-        superbatch_limit = embeds_orig.tokens_free()
+        activation_checkpoints = []
 
+        # (2) Forward pass steps
+        yield
+        m = QRM.llama3_lora.build_trainable_tok_embeddings(
+            model_with_lora, quant_weights, train_params, device)
+        activations = [m(sample) for sample in samples]
+        MEMORY_ACCOUNTING.register_all(activations, 'activations')
+        activation_checkpoints.append(activations)
+        del m
 
-        pbar_samples = tqdm(desc='samples', total=max_samples, smoothing=0)
-        pbar_superbatch = tqdm(desc='superbatch', total=max_samples)
-        pbar_superbatch_forward = tqdm(desc='superbatch forward', total=2 + arch.num_layers)
-        pbar_superbatch_layer = tqdm(desc='superbatch layer', total=1)
-        pbar_train_forward = tqdm(desc='train forward', total=1)
-        pbar_train_backward = tqdm(desc='train backward', total=1)
+        for i in range(arch.num_layers):
+            yield
+            m = QRM.llama3_lora.build_trainable_layer(
+                model_with_lora, quant_weights, train_params, i, device)
+            activations = [m(act) for act in activations]
+            MEMORY_ACCOUNTING.register(activations, 'activations')
+            activation_checkpoints.append(activations)
+            del m
 
-        total_tokens = 0
+        yield
+        m = QRM.llama3_lora.build_trainable_norm(
+            model_with_lora, quant_weights, train_params, device)
+        activations = [m(act) for act in activations]
+        MEMORY_ACCOUNTING.register_all(activations, 'activations')
+        # Norm output is not recorded as a checkpoint.
+        del m
 
-        for superbatch_samples in sized_chunks(samples_iter, superbatch_limit,
-                lambda t: t.numel()):
-            run_forward_superbatch(
-                model,
-                orig_weights,
-                superbatch_samples,
-                embeds_orig,
-                device,
-                pbar_forward = pbar_superbatch_forward,
-                pbar_layer = pbar_superbatch_layer,
-            )
-            pbar_superbatch.update(len(superbatch_samples))
+        # Final activations are kept around for later use in
+        # calc_loss.
 
-            MEMORY_ACCOUNTING.report('after forward superbatch')
+        # (3) Before backward pass
+        yield
+        m_train = QRM.llama3_lora.build_trainable_output(
+            model_with_lora, quant_weights, train_params, device)
 
-            # Train using the collected embeddings.
-            with record_time(metrics, 'train_time'):
-                for samples_start in range(0, len(superbatch_samples), gradient_accumulation_steps):
-                    samples = superbatch_samples[samples_start :
-                        samples_start + gradient_accumulation_steps]
-                    samples = [t.to(device).requires_grad_(False) for t in samples]
-                    MEMORY_ACCOUNTING.register_all(samples, 'samples')
+        # Sum of loss values (used only for logging).
+        loss_sum = 0.0
+        gradients = []
+        for i in range(len(samples)):
+            # (4) Receive orig_log_prob for each sample
+            orig_log_prob = yield
 
-                    pbar_train_forward.reset(2 + arch.num_layers)
-                    pbar_train_backward.reset(1 + 2 + arch.num_layers)
+            def calc_loss(train_embeds: Tensor) -> Tensor:
+                train_logits = m_train(train_embeds)
+                MEMORY_ACCOUNTING.register(train_logits, 'train_logits')
+                train_log_prob = F.log_softmax(train_logits, dim=-1)
+                MEMORY_ACCOUNTING.register(train_log_prob, 'train_log_prob')
+                train_log_prob = train_log_prob.view(-1, arch.vocab_size)
+                del train_logits
 
-                    activation_checkpoints = []
-                    with torch.no_grad():
-                        m = QRM.llama3_lora.build_trainable_tok_embeddings(
-                            model_with_lora, quant_weights, train_params, device)
-                        activations = [m(sample) for sample in samples]
-                        MEMORY_ACCOUNTING.register_all(activations, 'activations')
-                        activation_checkpoints.append(activations)
-                        pbar_train_forward.update()
-                        del m
+                loss = kl_div_loss_fn(train_log_prob, orig_log_prob)
+                MEMORY_ACCOUNTING.register(loss, 'loss')
+                loss = loss / len(samples)
+                return loss
 
-                        for i in range(arch.num_layers):
-                            m = QRM.llama3_lora.build_trainable_layer(
-                                model_with_lora, quant_weights, train_params, i, device)
-                            activations = [m(act) for act in activations]
-                            MEMORY_ACCOUNTING.register(activations, 'activations')
-                            activation_checkpoints.append(activations)
-                            pbar_train_forward.update()
-                            del m
+            train_embeds = activations[i]
+            loss, grad = run_initial_backward_step(train_embeds, calc_loss)
+            MEMORY_ACCOUNTING.register(grad, 'backward gradients')
 
-                        m = QRM.llama3_lora.build_trainable_norm(
-                            model_with_lora, quant_weights, train_params, device)
-                        activations = [m(act) for act in activations]
-                        MEMORY_ACCOUNTING.register_all(activations, 'activations')
-                        # Norm output is not recorded as a checkpoint.
-                        pbar_train_forward.update()
-                        del m
+            gradients.append(grad)
+            loss_sum += loss.item()
 
-                        # Final activations are kept around for later use in
-                        # calc_loss.
+        # Loss is already divided by `len(samples)` (which is the number of
+        # gradient accumulation steps) inside `calc_loss`.
+        #loss_avg = loss_sum / len(samples)
+        loss_avg = loss_sum
+        del m_train
 
-                    MEMORY_ACCOUNTING.report('after train forward pass')
+        # (5) Remaining backward pass steps
+        yield
+        m = QRM.llama3_lora.build_trainable_norm(
+            model_with_lora, quant_weights, train_params, device)
+        for i, act in enumerate(activation_checkpoints.pop()):
+            gradients[i] = run_backward_step(act, gradients[i], m)
+        MEMORY_ACCOUNTING.register_all(gradients, 'backward gradients')
+        del m, act
 
-                    # Run loss forward and backward
-                    m_orig = QRM.llama3.build_forward_output(model, orig_weights, device)
-                    m_train = QRM.llama3_lora.build_trainable_output(
-                        model_with_lora, quant_weights, train_params, device)
+        for i in reversed(range(arch.num_layers)):
+            yield
+            m = QRM.llama3_lora.build_trainable_layer(
+                model_with_lora, quant_weights, train_params, i, device)
+            for j, act in enumerate(activation_checkpoints.pop()):
+                gradients[j] = run_backward_step(act, gradients[j], m)
+            MEMORY_ACCOUNTING.register_all(gradients, 'backward gradients')
+            del m, act
 
-                    # Sum of loss values (used only for logging).
-                    loss_sum = 0.0
-                    gradients = []
-                    for i in range(len(samples)):
-                        def calc_loss(train_embeds: Tensor) -> Tensor:
-                            orig_logits = m_orig(embeds_orig[samples_start + i].to(device))
-                            MEMORY_ACCOUNTING.register(orig_logits, 'orig_logits')
-                            orig_log_prob = F.log_softmax(orig_logits, dim=-1)
-                            MEMORY_ACCOUNTING.register(orig_log_prob, 'orig_log_prob')
-                            orig_log_prob = orig_log_prob.view(-1, arch.vocab_size)
-                            del orig_logits
+        yield
+        m = QRM.llama3_lora.build_trainable_tok_embeddings(
+            model_with_lora, quant_weights, train_params, device)
+        for i, sample in enumerate(samples):
+            run_final_backward_step(sample, gradients[i], m)
+        del m, sample, gradients
 
-                            train_logits = m_train(train_embeds)
-                            MEMORY_ACCOUNTING.register(train_logits, 'train_logits')
-                            train_log_prob = F.log_softmax(train_logits, dim=-1)
-                            MEMORY_ACCOUNTING.register(train_log_prob, 'train_log_prob')
-                            train_log_prob = train_log_prob.view(-1, arch.vocab_size)
-                            del train_logits
+        # (6) Run optimizer
+        yield
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        lr_scheduler.step()
 
-                            loss = kl_div_loss_fn(train_log_prob, orig_log_prob)
-                            MEMORY_ACCOUNTING.register(loss, 'loss')
-                            return loss
-
-                        train_embeds = activations[i]
-                        loss, grad = run_initial_backward_step(train_embeds, calc_loss)
-                        MEMORY_ACCOUNTING.register(grad, 'backward gradients')
-
-                        gradients.append(grad)
-                        loss_sum += loss.item()
-
-                    loss_avg = loss_sum / len(samples)
-                    del m_orig, m_train
-                    pbar_train_backward.update()
-
-                    # Run remaining backward steps.
-
-                    m = QRM.llama3_lora.build_trainable_norm(
-                        model_with_lora, quant_weights, train_params, device)
-                    for i, act in enumerate(activation_checkpoints.pop()):
-                        gradients[i] = run_backward_step(act, gradients[i], m)
-                    MEMORY_ACCOUNTING.register_all(gradients, 'backward gradients')
-                    del m, act
-                    pbar_train_backward.update()
-
-                    for i in reversed(range(arch.num_layers)):
-                        m = QRM.llama3_lora.build_trainable_layer(
-                            model_with_lora, quant_weights, train_params, i, device)
-                        for j, act in enumerate(activation_checkpoints.pop()):
-                            gradients[j] = run_backward_step(act, gradients[j], m)
-                        MEMORY_ACCOUNTING.register_all(gradients, 'backward gradients')
-                        del m, act
-                        pbar_train_backward.update()
-
-                    m = QRM.llama3_lora.build_trainable_tok_embeddings(
-                        model_with_lora, quant_weights, train_params, device)
-                    for i, sample in enumerate(samples):
-                        run_final_backward_step(sample, gradients[i], m)
-                    del m, sample, gradients
-                    pbar_train_backward.update()
-
-                    MEMORY_ACCOUNTING.report('after train backward pass')
-
-                    with record_time(metrics, 'opt_time'):
-                        optimizer.step()
-                        optimizer.zero_grad(set_to_none=True)
-                        lr_scheduler.step()
-
-                    pbar_samples.set_description(
-                        f"Loss: {loss_avg:.6e}"
-                    )
-                    pbar_samples.update(len(samples))
-                    total_tokens += sum(x.numel() for x in samples)
-
-                    metrics['loss'] = loss_avg
-                    metrics['lr'] = optimizer.param_groups[0]["lr"]
-                    metrics['gpu_resources'] = torch.cuda.memory_allocated()
-                    write_log(metrics)
-
-        pbar_samples.close()
-        pbar_superbatch.close()
-        pbar_superbatch_forward.close()
-        pbar_superbatch_layer.close()
-        pbar_train_forward.close()
-        pbar_train_backward.close()
-
-        print('trained on %d tokens' % total_tokens)
-
-    MEMORY_ACCOUNTING.report('after training loop')
+        metrics['loss'] = loss_avg
+        metrics['lr'] = optimizer.param_groups[0]["lr"]
+        metrics['gpu_resources'] = torch.cuda.memory_allocated()
+        write_log(metrics)
 
 
     state_dict = {}
@@ -670,9 +787,9 @@ def run(cfg):
         save_low_rank_adapter_params(name + '.output', params.output)
 
     save_trainable_params('params', train_params)
-    checkpoint_path = os.path.join(quant_dir, 'repair_ckpt_%s.pt' % timestamp)
+    checkpoint_path = os.path.join(output_dir, 'repair_ckpt_%s.pt' % ident)
     torch.save(state_dict, checkpoint_path)
-    print('\n\nsaved %s' % checkpoint_path)
+    print('\nsaved %s' % checkpoint_path)
 
 
 if __name__ == '__main__':
