@@ -6,44 +6,84 @@
 //#include <ggml-quants.h>
 #include "dequant_cpu.h"
 
-torch::Tensor dequant_q6_K(torch::Tensor data) {
-    TORCH_CHECK(data.sizes().size() == 1, "data must have exactly 1 dimension");
+template <typename block_t, unsigned DEQUANT_BLOCK_SIZE, typename dequantize_func_t>
+void dequantize_fp32_cpu_impl(
+    torch::Tensor data,
+    torch::Tensor out,
+    dequantize_func_t dequantize_func
+) {
     TORCH_CHECK(data.device().is_cpu(), "data must be a cpu tensor");
-    size_t quant_size = data.sizes()[0];
-    TORCH_CHECK(quant_size % sizeof(block_q6_K) == 0,
-        "data size must be a multiple of sizeof(block_q6_K)");
-    size_t num_blocks = quant_size / sizeof(block_q6_K);
-    auto out_options = torch::TensorOptions()
-        .dtype(torch::kFloat32)
-        .device(torch::kCPU);
-    auto out = torch::ones({(ssize_t)num_blocks * QK_K}, out_options);
+    TORCH_CHECK(data.scalar_type() == torch::kByte, "data must be a byte tensor");
+    auto data_size = data.sizes();
+    TORCH_CHECK(data_size.size() == 2, "data must have 2 dimensions");
+    TORCH_CHECK(data_size[1] == sizeof(block_t), "data.shape[1] must match block size");
+    TORCH_CHECK(data.is_contiguous(), "data must be contiguous");
+
+    TORCH_CHECK(out.device().is_cpu(), "out must be a cpu tensor");
+    TORCH_CHECK(out.scalar_type() == torch::kFloat32, "out must be a float32 tensor");
+    auto out_size = out.sizes();
+    TORCH_CHECK(out_size.size() == 2, "out must have 2 dimensions");
+    TORCH_CHECK(out_size[0] == data_size[0], "out.shape[0] must match data.shape[0]");
+    TORCH_CHECK(out_size[1] == DEQUANT_BLOCK_SIZE,
+        "out.shape[1] must match dequantized block size");
+    TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
 
     const void* data_ptr = data.const_data_ptr();
-    TORCH_CHECK((uintptr_t)data_ptr % alignof(block_q6_K) == 0,
-        "data ptr is misaligned for block_q6_K");
-    const block_q6_K* data_block_ptr = (const block_q6_K*)data_ptr;
+    TORCH_CHECK((uintptr_t)data_ptr % alignof(block_t) == 0,
+        "data ptr is misaligned for block type");
+    const block_t* data_block_ptr = (const block_t*)data_ptr;
 
     float* out_ptr = out.mutable_data_ptr<float>();
-    std::cout << "out ptr = " << (void*)out_ptr << "\n";
 
-    dequantize_row_q6_K(data_block_ptr, out_ptr, num_blocks * QK_K);
+    dequantize_func(data_block_ptr, out_ptr, data_size[0] * DEQUANT_BLOCK_SIZE);
+}
 
-    return out;
+void dequantize_fp32_cpu(
+    torch::Tensor data,
+    torch::Tensor out,
+    int quant_type
+) {
+    switch (quant_type) {
+        case GGML_TYPE_Q4_0:
+            dequantize_fp32_cpu_impl<block_q4_0, QK4_0>(data, out, dequantize_row_q4_0);
+            break;
+        case GGML_TYPE_Q4_1:
+            dequantize_fp32_cpu_impl<block_q4_1, QK4_1>(data, out, dequantize_row_q4_1);
+            break;
+        case GGML_TYPE_Q5_0:
+            dequantize_fp32_cpu_impl<block_q5_0, QK5_0>(data, out, dequantize_row_q5_0);
+            break;
+        case GGML_TYPE_Q5_1:
+            dequantize_fp32_cpu_impl<block_q5_1, QK5_1>(data, out, dequantize_row_q5_1);
+            break;
+        case GGML_TYPE_Q8_0:
+            dequantize_fp32_cpu_impl<block_q8_0, QK8_0>(data, out, dequantize_row_q8_0);
+            break;
+
+        case GGML_TYPE_Q2_K:
+            dequantize_fp32_cpu_impl<block_q2_K, QK_K>(data, out, dequantize_row_q2_K);
+            break;
+        case GGML_TYPE_Q3_K:
+            dequantize_fp32_cpu_impl<block_q3_K, QK_K>(data, out, dequantize_row_q3_K);
+            break;
+        case GGML_TYPE_Q4_K:
+            dequantize_fp32_cpu_impl<block_q4_K, QK_K>(data, out, dequantize_row_q4_K);
+            break;
+        case GGML_TYPE_Q5_K:
+            dequantize_fp32_cpu_impl<block_q5_K, QK_K>(data, out, dequantize_row_q5_K);
+            break;
+        case GGML_TYPE_Q6_K:
+            dequantize_fp32_cpu_impl<block_q6_K, QK_K>(data, out, dequantize_row_q6_K);
+            break;
+        case GGML_TYPE_Q8_K:
+            dequantize_fp32_cpu_impl<block_q8_K, QK_K>(data, out, dequantize_row_q8_K);
+            break;
+
+        default:
+            TORCH_CHECK(false, "unsupported quant type");
+    }
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-
-#if 0
-    // Need to call `ggml_init` once to initialize some lookup tables used in
-    // dequantize functions.
-    struct ggml_init_params params = {
-        /*.mem_size   =*/ 0,
-        /*.mem_buffer =*/ NULL,
-        /*.no_alloc   =*/ true,
-    };
-    ggml_context * ctx = ggml_init(params);
-    ggml_free(ctx);
-#endif
-
-    m.def("dequant_q6_K", &dequant_q6_K, "dequant_q6_K");
+    m.def("dequantize_fp32_cpu", &dequantize_fp32_cpu, "dequantize_fp32_cpu");
 }
