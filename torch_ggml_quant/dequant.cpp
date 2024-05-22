@@ -2,8 +2,9 @@
 
 #include <iostream>
 
-#include <ggml-common.h>
-#include <ggml-quants.h>
+//#include <ggml-common.h>
+//#include <ggml-quants.h>
+#include "dequant_cpu.h"
 
 torch::Tensor dequant_q6_K(torch::Tensor data) {
     TORCH_CHECK(data.sizes().size() == 1, "data must have exactly 1 dimension");
@@ -32,6 +33,7 @@ torch::Tensor dequant_q6_K(torch::Tensor data) {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
+#if 0
     // Need to call `ggml_init` once to initialize some lookup tables used in
     // dequantize functions.
     struct ggml_init_params params = {
@@ -41,6 +43,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     };
     ggml_context * ctx = ggml_init(params);
     ggml_free(ctx);
+#endif
 
     m.def("dequant_q6_K", &dequant_q6_K, "dequant_q6_K");
 }

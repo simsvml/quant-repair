@@ -7,6 +7,7 @@ setup(name='torch_ggml_quant',
         'torch_ggml_quant',
         [
             'dequant.cpp',
+            'dequant_cpu.cpp',
         ],
         include_dirs = [
             os.environ.get('LLAMA_CPP_INCLUDEDIR', '../llama.cpp'),
@@ -15,7 +16,7 @@ setup(name='torch_ggml_quant',
             os.environ.get('LLAMA_CPP_LIBDIR', '../llama.cpp'),
         ],
         libraries = [
-            'llama',
+            #'llama',
         ],
     )],
     cmdclass={'build_ext': cpp_extension.BuildExtension})
