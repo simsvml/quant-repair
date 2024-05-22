@@ -43,10 +43,26 @@ enum ggml_type {
 };
 
 
-typedef uint16_t ggml_half;
-typedef uint32_t ggml_half2;
+// Placeholder for `ggml_half` used in non-CUDA code.
+typedef uint16_t ggml_half_placeholder;
+typedef uint32_t ggml_half2_placeholder;
 
+#ifdef __CUDACC__
+
+#include <cuda_fp16.h>
+typedef half ggml_half;
+typedef half2 ggml_half2;
+#define GGML_COMMON_AGGR data
+
+#else
+
+typedef ggml_half_placeholder ggml_half;
+typedef ggml_half2_placeholder ggml_half2;
 #define GGML_COMMON_AGGR
+
+#endif
+
+
 
 
 #define QK4_0 32
