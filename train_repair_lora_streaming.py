@@ -19,7 +19,7 @@ from torchtune.models.llama3 import llama3_tokenizer_transformers
 from torchtune.modules import quantized, lr_schedulers
 from torchtune.modules import RotaryPositionalEmbeddings
 from torchtune.utils import set_default_dtype
-from gguf import GGMLQuantizationType
+from gguf import GGMLQuantizationType, GGUFReader
 from quant_repair.architecture import Llama3Arch
 from quant_repair.common import build_module, load_weights, init_lora_weights
 from quant_repair.datasets import load_slimorca_dataset
@@ -32,8 +32,29 @@ from quant_repair.model_util.llama3_lora import TrainableParams, LayerTrainableP
 from quant_repair.model_util.superbatch import run_forward_superbatch
 from quant_repair.modules import LowRankAdapter, QuantLowRankAdapter, WithAdapter
 from quant_repair.offload import TensorOffload
+from quant_repair.quantized import DequantizeParams
 from quant_repair.weights import load_weights_safetensors_hf, \
     CheckpointStateDict, QuantizedCheckpointLoader
+
+
+def all_module_names(arch):
+    all_modules = [None]
+    all_modules.append('tok_embeddings')
+    for i in range(arch.num_layers):
+        all_modules.extend((
+            'layers.%d.attn.q_proj' % i,
+            'layers.%d.attn.k_proj' % i,
+            'layers.%d.attn.v_proj' % i,
+            'layers.%d.attn.output_proj' % i,
+            'layers.%d.mlp.w1' % i,
+            'layers.%d.mlp.w2' % i,
+            'layers.%d.mlp.w3' % i,
+            'layers.%d.sa_norm' % i,
+            'layers.%d.mlp_norm' % i,
+        ))
+    all_modules.append('norm')
+    all_modules.append('output')
+    return all_modules
 
 
 def run_backward_step(
@@ -201,28 +222,116 @@ def main3():
         #with torch.no_grad():
             run(configs)
 
-main = main3
+def main4():
+    cfgs = []
+
+    def add(batch_factor):
+        cfgs.append(dict(
+            override_rank = 32,
+            lr = 1.27e-5,
+            batch_factor = batch_factor,
+        ))
+
+    add(8)
+    add(32)
+    add(16)
+    add(4)
+
+    timestamp = time.strftime('%Y%m%d_%H%M%S')
+    log_file = open('train_configs_%s.log' % timestamp, 'w')
+
+    with set_default_dtype(torch.bfloat16):
+        #with torch.no_grad():
+            for cfg in cfgs:
+                start_time = time.time()
+                run([cfg])
+                end_time = time.time()
+                print('ran config %s in %fs' % (cfg, end_time - start_time))
+
+                obj = {
+                    'start_time': start_time,
+                    'end_time': end_time,
+                    'duration': end_time - start_time,
+                    'cfg': cfg,
+                }
+                json.dump(obj, log_file)
+                log_file.write('\n')
+                log_file.flush()
+
+main = main4
 
 def run(cfgs):
     if isinstance(cfgs, (dict, type(None))):
         cfgs = [cfgs]
 
-    assert len(sys.argv) == 4
+    assert len(sys.argv) in (3, 4)
     orig_dir = sys.argv[1]
-    quant_dir = sys.argv[2]
-    rank_map_path = sys.argv[3]
+    quant_path = sys.argv[2]
+    quant_dir = os.path.dirname(quant_path)
+    rank_map_path = sys.argv[3] if len(sys.argv) > 3 else None
 
     MEMORY_ACCOUNTING.disable()
 
     device = torch.device('cuda')
     arch = Llama3Arch.llama3_8b()
 
+
     print('loading original weights from %r' % (orig_dir,))
     orig_state_dict = load_weights_safetensors_hf(orig_dir, arch)
     orig_weights = CheckpointStateDict(orig_state_dict)
 
+
+    # Offload setup
     print('loading quantized weights from %r' % (quant_dir,))
-    quant_weights = QuantizedCheckpointLoader(quant_dir, dequant_device=device)
+    #offload = TensorOffload(device, vram_limit_gb=8)
+    offload = TensorOffload(device, vram_limit_gb=2)
+
+    offload.add_group('tok_embeddings')
+    for i in range(arch.num_layers):
+        offload.add_group('layers.%d' % i)
+    offload.add_group('norm')
+    offload.add_group('output')
+
+    gguf_reader = GGUFReader(quant_path)
+    gguf_tensors = {t.name: t for t in gguf_reader.tensors}
+    gguf_quant_map = {}
+
+    def offload_init_tensors():
+        def add_weight(group, name, gguf_name):
+            full_name = '%s.%s' % (group, name)
+
+            tensor = gguf_tensors[gguf_name]
+            shape_length = max((j + 1 for j, dim in enumerate(tensor.shape) if dim != 1),
+                default=len(tensor.shape))
+            shape = tuple(int(x) for x in reversed(tensor.shape[:shape_length]))
+            gguf_quant_map[full_name] = DequantizeParams(
+                quant = tensor.tensor_type,
+                shape = shape,
+            )
+
+            torch_tensor = torch.from_numpy(tensor.data)
+            offload.add_tensor(group, full_name, torch_tensor, read_only=True)
+
+        add_weight('tok_embeddings', 'weight', 'token_embd.weight')
+        for i in range(arch.num_layers):
+            add_weight('layers.%d' % i, 'attn.q_proj.weight', 'blk.%d.attn_q.weight' % i)
+            add_weight('layers.%d' % i, 'attn.k_proj.weight', 'blk.%d.attn_k.weight' % i)
+            add_weight('layers.%d' % i, 'attn.v_proj.weight', 'blk.%d.attn_v.weight' % i)
+            add_weight('layers.%d' % i, 'attn.output_proj.weight', 'blk.%d.attn_output.weight' % i)
+            add_weight('layers.%d' % i, 'mlp.w1.weight', 'blk.%d.ffn_gate.weight' % i)
+            add_weight('layers.%d' % i, 'mlp.w2.weight', 'blk.%d.ffn_down.weight' % i)
+            add_weight('layers.%d' % i, 'mlp.w3.weight', 'blk.%d.ffn_up.weight' % i)
+            add_weight('layers.%d' % i, 'sa_norm.scale', 'blk.%d.attn_norm.weight' % i)
+            add_weight('layers.%d' % i, 'mlp_norm.scale', 'blk.%d.ffn_norm.weight' % i)
+        add_weight('norm', 'scale', 'output_norm.weight')
+        add_weight('output', 'weight', 'output.weight')
+    offload_init_tensors()
+
+    offload.build_partitions()
+
+    # Use `offload` for fetching base model weights.
+    quant_weights = offload
+
 
     tokenizer_json_path = os.path.join(orig_dir, 'tokenizer.json')
     print('loading tokenizer from %s' % tokenizer_json_path)
@@ -271,12 +380,12 @@ def run(cfgs):
     lora_dropout = 0.0
 
     def embedding_with_lora():
-        base = QRF.Embedding()
+        base = QRF.QuantEmbedding()
         adapter = QRF.EmbeddingLowRankAdapter(dropout = lora_dropout)
         return QRF.WithAdapter(base, adapter)
 
     def linear_with_lora():
-        base = QRF.Linear()
+        base = QRF.QuantLinear()
         adapter = QRF.LowRankAdapter(dropout = lora_dropout)
         return QRF.WithAdapter(base, adapter)
 
@@ -287,13 +396,17 @@ def run(cfgs):
     max_seq_len = 1024
     batch_size = 1
     total_epochs = 1
-    #max_steps_per_epoch = 1000
+    #max_steps_per_epoch = 1
     #max_steps_per_epoch = 1000
     #max_steps_per_epoch = 3500      # slimorca: 20M tokens
-    max_steps_per_epoch = 9000      # slimorca: 50M tokens
+    #max_steps_per_epoch = 9000      # slimorca: 50M tokens
     #max_steps_per_epoch = 18000     # slimorca: 100M tokens
     #max_steps_per_epoch = 2500
-    gradient_accumulation_steps = 16
+    #gradient_accumulation_steps = 16
+    assert len(cfgs) == 1
+    cfg = cfgs[0]
+    max_steps_per_epoch = 1000 * 16 // cfg['batch_factor']
+    gradient_accumulation_steps = cfg['batch_factor']
 
     max_samples = gradient_accumulation_steps * max_steps_per_epoch
 
@@ -309,43 +422,6 @@ def run(cfgs):
         seed=0,
         batch_size=batch_size,
     )
-
-
-    # Offload setup
-    print('loading quantized weights for offload')
-    offload = TensorOffload(device, vram_limit_gb=8)
-
-    offload.add_group('tok_embeddings')
-    for i in range(arch.num_layers):
-        offload.add_group('layers.%d' % i)
-    offload.add_group('norm')
-    offload.add_group('output')
-
-    def offload_init_tensors():
-        get1 = weights_getter(quant_weights, 'cpu')
-        def add_weight(group, name):
-            full_name = '%s.%s' % (group, name)
-            offload.add_tensor(group, full_name, get1(full_name), read_only=True)
-
-        add_weight('tok_embeddings', 'weight')
-        for i in range(arch.num_layers):
-            add_weight('layers.%d' % i, 'attn.q_proj.weight')
-            add_weight('layers.%d' % i, 'attn.k_proj.weight')
-            add_weight('layers.%d' % i, 'attn.v_proj.weight')
-            add_weight('layers.%d' % i, 'attn.output_proj.weight')
-            add_weight('layers.%d' % i, 'mlp.w1.weight')
-            add_weight('layers.%d' % i, 'mlp.w2.weight')
-            add_weight('layers.%d' % i, 'mlp.w3.weight')
-            add_weight('layers.%d' % i, 'sa_norm.scale')
-            add_weight('layers.%d' % i, 'mlp_norm.scale')
-        add_weight('norm', 'scale')
-        add_weight('output', 'weight')
-    offload_init_tensors()
-
-    offload.build_partitions()
-
-    # Use `offload` for fetching base model weights.
-    quant_weights = offload
 
 
     MEMORY_ACCOUNTING.report('before training loop')
@@ -385,6 +461,7 @@ def run(cfgs):
             arch = arch,
             rank_map_path = rank_map_path,
             quant_weights = quant_weights,
+            quant_map = gguf_quant_map,
             write_log = write_log,
             model_with_lora = model_with_lora,
             num_training_steps = total_epochs * max_steps_per_epoch,
@@ -528,6 +605,7 @@ def train(
     arch,
     rank_map_path,
     quant_weights,
+    quant_map,
     write_log,
     model_with_lora,
     num_training_steps,
@@ -548,7 +626,10 @@ def train(
     lora_alpha = 8
 
     dims = QRM.llama3_lora.linear_dimensions(arch)
-    rank_map = json.load(open(rank_map_path))
+    if rank_map_path is not None:
+        rank_map = json.load(open(rank_map_path))
+    else:
+        rank_map = {k: -1 for k in all_module_names(arch)}
 
     if cfg['override_rank'] is not None:
         for key in rank_map:
@@ -657,7 +738,7 @@ def train(
         # (2) Forward pass steps
         yield
         m = QRM.llama3_lora.build_trainable_tok_embeddings(
-            model_with_lora, quant_weights, train_params, device)
+            model_with_lora, quant_weights, train_params, device, quant_map)
         activations = [m(sample) for sample in samples]
         MEMORY_ACCOUNTING.register_all(activations, 'activations')
         activation_checkpoints.append(activations)
@@ -666,7 +747,7 @@ def train(
         for i in range(arch.num_layers):
             yield
             m = QRM.llama3_lora.build_trainable_layer(
-                model_with_lora, quant_weights, train_params, i, device)
+                model_with_lora, quant_weights, train_params, i, device, quant_map)
             activations = [m(act) for act in activations]
             MEMORY_ACCOUNTING.register(activations, 'activations')
             activation_checkpoints.append(activations)
@@ -674,7 +755,7 @@ def train(
 
         yield
         m = QRM.llama3_lora.build_trainable_norm(
-            model_with_lora, quant_weights, train_params, device)
+            model_with_lora, quant_weights, train_params, device, quant_map)
         activations = [m(act) for act in activations]
         MEMORY_ACCOUNTING.register_all(activations, 'activations')
         # Norm output is not recorded as a checkpoint.
@@ -686,7 +767,7 @@ def train(
         # (3) Before backward pass
         yield
         m_train = QRM.llama3_lora.build_trainable_output(
-            model_with_lora, quant_weights, train_params, device)
+            model_with_lora, quant_weights, train_params, device, quant_map)
 
         # Sum of loss values (used only for logging).
         loss_sum = 0.0
@@ -724,7 +805,7 @@ def train(
         # (5) Remaining backward pass steps
         yield
         m = QRM.llama3_lora.build_trainable_norm(
-            model_with_lora, quant_weights, train_params, device)
+            model_with_lora, quant_weights, train_params, device, quant_map)
         for i, act in enumerate(activation_checkpoints.pop()):
             gradients[i] = run_backward_step(act, gradients[i], m)
         MEMORY_ACCOUNTING.register_all(gradients, 'backward gradients')
@@ -733,7 +814,7 @@ def train(
         for i in reversed(range(arch.num_layers)):
             yield
             m = QRM.llama3_lora.build_trainable_layer(
-                model_with_lora, quant_weights, train_params, i, device)
+                model_with_lora, quant_weights, train_params, i, device, quant_map)
             for j, act in enumerate(activation_checkpoints.pop()):
                 gradients[j] = run_backward_step(act, gradients[j], m)
             MEMORY_ACCOUNTING.register_all(gradients, 'backward gradients')
@@ -741,7 +822,7 @@ def train(
 
         yield
         m = QRM.llama3_lora.build_trainable_tok_embeddings(
-            model_with_lora, quant_weights, train_params, device)
+            model_with_lora, quant_weights, train_params, device, quant_map)
         for i, sample in enumerate(samples):
             run_final_backward_step(sample, gradients[i], m)
         del m, sample, gradients

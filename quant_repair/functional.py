@@ -4,6 +4,7 @@ import torch
 from torch import Tensor
 from torch import nn
 from torch.nn import functional as F
+from quant_repair import quantized
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,39 @@ class LinearParams:
 class Linear:
     def run(self, params: LinearParams, x: Tensor) -> Tensor:
         return F.linear(x, params.weight, params.bias)
+
+
+@dataclass(frozen=True)
+class QuantEmbeddingParams:
+    weight: Tensor
+    weight_dequant: quantized.DequantizeParams
+
+    def tensors(self):
+        yield self.weight
+
+@dataclass(frozen=True)
+class QuantEmbedding:
+    def run(self, params: QuantEmbeddingParams, x: Tensor) -> Tensor:
+        return quantized.quant_embedding(x, params.weight, params.weight_dequant)
+
+
+@dataclass(frozen=True)
+class QuantLinearParams:
+    weight: Tensor
+    weight_dequant: quantized.DequantizeParams
+    bias: Optional[Tensor] = None
+    bias_dequant: Optional[quantized.DequantizeParams] = None
+
+    def tensors(self):
+        yield self.weight
+        if self.bias is not None:
+            yield self.bias
+
+@dataclass(frozen=True)
+class QuantLinear:
+    def run(self, params: QuantLinearParams, x: Tensor) -> Tensor:
+        return quantized.quant_linear(x, params.weight, params.weight_dequant,
+            params.bias, params.bias_dequant)
 
 
 @dataclass(frozen=True)

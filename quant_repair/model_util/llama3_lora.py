@@ -1,9 +1,11 @@
 from dataclasses import dataclass
-from typing import Tuple, List, Callable
+from typing import Tuple, List, Dict, Callable
 from torch import Tensor
+from torchtune.modules.quantized import UNQUANTIZED_TYPES
 from .. import functional as QRF
 from ..memory_accounting import MEMORY_ACCOUNTING
 from .misc import weights_getter
+from ..quantized import DequantizeParams
 
 
 @dataclass(frozen=True)
@@ -162,10 +164,19 @@ def build_trainable_tok_embeddings(
     loader,
     train_params: TrainableParams,
     device,
+    quant_map: Dict[str, DequantizeParams] = {},
 ) -> Callable[[Tensor], Tensor]:
     get1 = weights_getter(loader, device)
+    def make_embedding(name):
+        quant = quant_map.get(name)
+        x = get1(name)
+        if quant is None or quant in UNQUANTIZED_TYPES:
+            return QRF.EmbeddingParams(x)
+        else:
+            return QRF.QuantEmbeddingParams(x, quant)
+
     params = QRF.WithAdapterParams(
-        base = QRF.LinearParams(get1('tok_embeddings.weight')),
+        base = make_embedding('tok_embeddings.weight'),
         adapter = train_params.tok_embeddings,
     )
     MEMORY_ACCOUNTING.register_params(params, 'build_trainable_tok_embeddings params')
@@ -179,39 +190,48 @@ def build_trainable_layer(
     train_params: TrainableParams,
     layer_index: int,
     device,
+    quant_map: Dict[str, DequantizeParams] = {},
 ) -> Callable[[Tensor], Tensor]:
     get1 = weights_getter(loader, device)
+    def make_linear(name):
+        quant = quant_map.get(name)
+        x = get1(name)
+        if quant is None or quant in UNQUANTIZED_TYPES:
+            return QRF.LinearParams(x)
+        else:
+            return QRF.QuantLinearParams(x, quant)
+
     train_layer_params = train_params.layers[layer_index]
     params = QRF.TransformerDecoderLayerParams(
         attn = QRF.CausalSelfAttentionParams(
             q_proj = QRF.WithAdapterParams(
-                base = QRF.LinearParams(get1('layers.%d.attn.q_proj.weight' % layer_index)),
+                base = make_linear('layers.%d.attn.q_proj.weight' % layer_index),
                 adapter = train_layer_params.q_proj,
             ),
             k_proj = QRF.WithAdapterParams(
-                base = QRF.LinearParams(get1('layers.%d.attn.k_proj.weight' % layer_index)),
+                base = make_linear('layers.%d.attn.k_proj.weight' % layer_index),
                 adapter = train_layer_params.k_proj,
             ),
             v_proj = QRF.WithAdapterParams(
-                base = QRF.LinearParams(get1('layers.%d.attn.v_proj.weight' % layer_index)),
+                base = make_linear('layers.%d.attn.v_proj.weight' % layer_index),
                 adapter = train_layer_params.v_proj,
             ),
             output_proj = QRF.WithAdapterParams(
-                base = QRF.LinearParams(get1('layers.%d.attn.output_proj.weight' % layer_index)),
+                base = make_linear('layers.%d.attn.output_proj.weight' % layer_index),
                 adapter = train_layer_params.output_proj,
             ),
         ),
         mlp = QRF.FeedForwardParams(
             gate_proj = QRF.WithAdapterParams(
-                base = QRF.LinearParams(get1('layers.%d.mlp.w1.weight' % layer_index)),
+                base = make_linear('layers.%d.mlp.w1.weight' % layer_index),
                 adapter = train_layer_params.gate_proj,
             ),
             down_proj = QRF.WithAdapterParams(
-                base = QRF.LinearParams(get1('layers.%d.mlp.w2.weight' % layer_index)),
+                base = make_linear('layers.%d.mlp.w2.weight' % layer_index),
                 adapter = train_layer_params.down_proj,
             ),
             up_proj = QRF.WithAdapterParams(
-                base = QRF.LinearParams(get1('layers.%d.mlp.w3.weight' % layer_index)),
+                base = make_linear('layers.%d.mlp.w3.weight' % layer_index),
                 adapter = train_layer_params.up_proj,
             ),
         ),
@@ -228,6 +248,7 @@ def build_trainable_norm(
     loader,
     train_params: TrainableParams,
     device,
+    quant_map: Dict[str, DequantizeParams] = {},
 ) -> Callable[[Tensor], Tensor]:
     params = train_params.norm
     MEMORY_ACCOUNTING.register_params(params, 'build_trainable_norm params')
@@ -240,10 +261,19 @@ def build_trainable_output(
     loader,
     train_params: TrainableParams,
     device,
+    quant_map: Dict[str, DequantizeParams] = {},
 ) -> Callable[[Tensor], Tensor]:
     get1 = weights_getter(loader, device)
+    def make_linear(name):
+        quant = quant_map.get(name)
+        x = get1(name)
+        if quant is None or quant in UNQUANTIZED_TYPES:
+            return QRF.LinearParams(x)
+        else:
+            return QRF.QuantLinearParams(x, quant)
+
     params = QRF.WithAdapterParams(
-        base = QRF.LinearParams(get1('output.weight')),
+        base = make_linear('output.weight'),
         adapter = train_params.output,
     )
     MEMORY_ACCOUNTING.register_params(params, 'build_trainable_output params')
