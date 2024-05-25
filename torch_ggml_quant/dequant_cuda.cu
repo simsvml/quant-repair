@@ -19,7 +19,7 @@
 #include <cuda_fp16.h>
 
 
-//================================== k-quants
+// K-quant blocks
 
 template<typename dst_t>
 static __global__ void dequantize_block_q2_K(const void * __restrict__ vx, dst_t * __restrict__ yy) {
@@ -254,6 +254,8 @@ static __global__ void dequantize_block_q6_K(const void * __restrict__ vx, dst_t
 }
 
 
+// K-quant rows
+
 template<typename dst_t>
 static void dequantize_row_q2_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
@@ -315,6 +317,295 @@ static void dequantize_row_q6_K_cuda(const void * vx, dst_t * y, const int64_t k
 }
 
 
+// I-quant grids
+#define GGML_TABLE_BEGIN(type, name, size) static const __device__ type name[size] = {
+#define GGML_TABLE_END() };
+#define GGML_IQUANT_TABLES_GPU
+#include "iquant_tables.inc"
+
+static const __device__ int8_t kvalues_iq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+
+
+// I-quant blocks
+
+template<typename dst_t>
+static __global__ void dequantize_block_iq2_xxs(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+
+    const int64_t i   = blockIdx.x;
+    const block_iq2_xxs * x = (const block_iq2_xxs  *) vx;
+
+    const int64_t tid = threadIdx.x;
+#if QK_K == 256
+    const int64_t il = tid/8; // 0...3
+    const int64_t ib = tid%8; // 0...7
+    dst_t * y = yy + i*QK_K + 32*ib + 8*il;
+    const uint16_t * q2 = x[i].qs + 4*ib;
+    const uint8_t  * aux8 = (const uint8_t *)q2;
+    const uint8_t  * grid = (const uint8_t *)(iq2xxs_grid + aux8[il]);
+    const uint32_t aux32 = q2[2] | (q2[3] << 16);
+    const float d = (float)x[i].d * (0.5f + (aux32 >> 28)) * 0.25f;
+    const uint8_t signs = ksigns_iq2xs[(aux32 >> 7*il) & 127];
+    for (int j = 0; j < 8; ++j) y[j] = d * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+#else
+    NO_DEVICE_CODE;
+#endif
+
+}
+
+template<typename dst_t>
+static __global__ void dequantize_block_iq2_xs(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+
+    const int64_t i   = blockIdx.x;
+    const block_iq2_xs * x = (const block_iq2_xs *) vx;
+
+    const int64_t tid = threadIdx.x;
+#if QK_K == 256
+    const int64_t il = tid/8; // 0...3
+    const int64_t ib = tid%8; // 0...7
+    dst_t * y = yy + i*QK_K + 32*ib + 8*il;
+    const uint16_t * q2 = x[i].qs + 4*ib;
+    const uint8_t  * grid = (const uint8_t *)(iq2xs_grid + (q2[il] & 511));
+    const float d = (float)x[i].d * (0.5f + ((x[i].scales[ib] >> 4*(il/2)) & 0xf)) * 0.25f;
+    const uint8_t signs = ksigns_iq2xs[q2[il] >> 9];
+    for (int j = 0; j < 8; ++j) y[j] = d * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+#else
+    NO_DEVICE_CODE;
+#endif
+
+}
+
+template<typename dst_t>
+static __global__ void dequantize_block_iq2_s(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+
+    const int64_t i   = blockIdx.x;
+    const block_iq2_s * x = (const block_iq2_s *) vx;
+
+    const int64_t tid = threadIdx.x;
+#if QK_K == 256
+    const int64_t il = tid/8; // 0...3
+    const int64_t ib = tid%8; // 0...7
+    dst_t * y = yy + i*QK_K + 32*ib + 8*il;
+    const uint8_t * grid = (const uint8_t *)(iq2s_grid + (x[i].qs[4*ib+il] | ((x[i].qh[ib] << (8-2*il)) & 0x300)));
+    const float d = (float)x[i].d * (0.5f + ((x[i].scales[ib] >> 4*(il/2)) & 0xf)) * 0.25f;
+    const uint8_t signs = x[i].qs[QK_K/8+4*ib+il];
+    for (int j = 0; j < 8; ++j) y[j] = d * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+#else
+    NO_DEVICE_CODE;
+#endif
+
+}
+
+template<typename dst_t>
+static __global__ void dequantize_block_iq3_xxs(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+
+    const int64_t i   = blockIdx.x;
+    const block_iq3_xxs * x = (const block_iq3_xxs  *) vx;
+
+    const int64_t tid = threadIdx.x;
+#if QK_K == 256
+    const int64_t il = tid/8; // 0...3
+    const int64_t ib = tid%8; // 0...7
+    dst_t * y = yy + i*QK_K + 32*ib + 8*il;
+    const uint8_t  * q3 = x[i].qs + 8*ib;
+    const uint16_t * gas = (const uint16_t *)(x[i].qs + QK_K/4) + 2*ib;
+    const uint8_t  * grid1 = (const uint8_t *)(iq3xxs_grid + q3[2*il+0]);
+    const uint8_t  * grid2 = (const uint8_t *)(iq3xxs_grid + q3[2*il+1]);
+    const uint32_t aux32 = gas[0] | (gas[1] << 16);
+    const float d = (float)x[i].d * (0.5f + (aux32 >> 28)) * 0.5f;
+    const uint8_t signs = ksigns_iq2xs[(aux32 >> 7*il) & 127];
+    for (int j = 0; j < 4; ++j) {
+        y[j+0] = d * grid1[j] * (signs & kmask_iq2xs[j+0] ? -1.f : 1.f);
+        y[j+4] = d * grid2[j] * (signs & kmask_iq2xs[j+4] ? -1.f : 1.f);
+    }
+#else
+    NO_DEVICE_CODE;
+#endif
+
+}
+
+template<typename dst_t>
+static __global__ void dequantize_block_iq3_s(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+
+    const int64_t i   = blockIdx.x;
+    const block_iq3_s * x = (const block_iq3_s *) vx;
+
+    const int64_t tid = threadIdx.x;
+#if QK_K == 256
+    const int64_t il = tid/8; // 0...3
+    const int64_t ib = tid%8; // 0...7
+    dst_t * y = yy + i*QK_K + 32*ib + 8*il;
+    const uint8_t * qs = x[i].qs + 8*ib;
+    const uint8_t * grid1 = (const uint8_t *)(iq3s_grid + (qs[2*il+0] | ((x[i].qh[ib] << (8-2*il)) & 256)));
+    const uint8_t * grid2 = (const uint8_t *)(iq3s_grid + (qs[2*il+1] | ((x[i].qh[ib] << (7-2*il)) & 256)));
+    const float d = (float)x[i].d * (1 + 2*((x[i].scales[ib/2] >> 4*(ib%2)) & 0xf));
+    const uint8_t signs = x[i].signs[4*ib + il];
+    for (int j = 0; j < 4; ++j) {
+        y[j+0] = d * grid1[j] * (signs & kmask_iq2xs[j+0] ? -1.f : 1.f);
+        y[j+4] = d * grid2[j] * (signs & kmask_iq2xs[j+4] ? -1.f : 1.f);
+    }
+#else
+    NO_DEVICE_CODE;
+#endif
+
+}
+
+template<typename dst_t>
+static __global__ void dequantize_block_iq1_s(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+
+    const int64_t i   = blockIdx.x;
+    const block_iq1_s * x = (const block_iq1_s  *) vx;
+
+    const int64_t tid = threadIdx.x;
+#if QK_K == 256
+    const int64_t il = tid/8; // 0...3
+    const int64_t ib = tid%8; // 0...7
+    dst_t * y = yy + i*QK_K + 32*ib + 8*il;
+    const float delta = x[i].qh[ib] & 0x8000 ? -1 - IQ1S_DELTA : -1 + IQ1S_DELTA;
+    const float d = (float)x[i].d * (2*((x[i].qh[ib] >> 12) & 7) + 1);
+    uint32_t grid32[2]; const int8_t * q = (const int8_t *)grid32;
+    grid32[0] = iq1s_grid_gpu[x[i].qs[4*ib+il] | (((x[i].qh[ib] >> 3*il) & 7) << 8)];
+    grid32[1] = (grid32[0] >> 4) & 0x0f0f0f0f;
+    grid32[0] &= 0x0f0f0f0f;
+    for (int j = 0; j < 8; ++j) {
+        y[j] = d * (q[j] + delta);
+    }
+#else
+    NO_DEVICE_CODE;
+#endif
+
+}
+
+template<typename dst_t>
+static __global__ void dequantize_block_iq1_m(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+
+    const int64_t i   = blockIdx.x;
+    const block_iq1_m * x = (const block_iq1_m  *) vx;
+
+    const int64_t tid = threadIdx.x;
+#if QK_K == 256
+    const int64_t il = tid/8; // 0...3
+    const int64_t ib = tid%8; // 0...7
+    dst_t * y = yy + i*QK_K + 32*ib + 8*il;
+    const uint16_t * sc = (const uint16_t *)x[i].scales;
+    iq1m_scale_t scale;
+    scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+    const int64_t ib16 = 2*ib + il/2; // sc[ib16/4] >> 3*(ib16%4) -> sc[ib/2] >> 3*((2*ib+il/2)%4);
+    const float d = (float)scale.f16 * (2*((sc[ib16/4] >> 3*(ib16%4)) & 0x7) + 1);
+    const float delta = x[i].qh[2*ib+il/2] & (0x08 << 4*(il%2)) ? -1 - IQ1M_DELTA : -1 + IQ1M_DELTA;
+    uint32_t grid32[2]; const int8_t * q = (const int8_t *)grid32;
+    grid32[0] = iq1s_grid_gpu[x[i].qs[4*ib+il] | (((x[i].qh[2*ib+il/2] >> 4*(il%2)) & 7) << 8)];
+    grid32[1] = (grid32[0] >> 4) & 0x0f0f0f0f;
+    grid32[0] &= 0x0f0f0f0f;
+    for (int j = 0; j < 8; ++j) {
+        y[j] = d * (q[j] + delta);
+    }
+#else
+    NO_DEVICE_CODE;
+#endif
+
+}
+
+
+template<typename dst_t>
+static __global__ void dequantize_block_iq4_nl(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+
+    const int64_t i   = blockIdx.x;
+    const block_iq4_nl * x = (const block_iq4_nl *) vx + i*(QK_K/QK4_NL);
+
+    const int64_t tid = threadIdx.x;
+    const int64_t il = tid/8; // 0...3
+    const int64_t ib = tid%8; // 0...7
+    dst_t * y = yy + i*QK_K + 32*ib + 4*il;
+    const uint8_t  * q4 = x[ib].qs + 4*il;
+    const float d = (float)x[ib].d;
+    for (int j = 0; j < 4; ++j) {
+        y[j+ 0] = d * kvalues_iq4nl[q4[j] & 0xf];
+        y[j+16] = d * kvalues_iq4nl[q4[j] >>  4];
+    }
+
+}
+
+#if QK_K != 64
+template<typename dst_t>
+static __global__ void dequantize_block_iq4_xs(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    const int64_t i   = blockIdx.x;
+    const block_iq4_xs * x = (const block_iq4_xs *)vx;
+
+    const int64_t tid = threadIdx.x;
+    const int64_t il = tid/8; // 0...3
+    const int64_t ib = tid%8; // 0...7
+    dst_t * y = yy + i*QK_K + 32*ib + 4*il;
+    const uint8_t  * q4 = x[i].qs + 16*ib + 4*il;
+    const float d = (float)x[i].d * ((((x[i].scales_l[ib/2] >> 4*(ib%2)) & 0xf) | (((x[i].scales_h >> 2*ib) & 3) << 4)) - 32);
+    for (int j = 0; j < 4; ++j) {
+        y[j+ 0] = d * kvalues_iq4nl[q4[j] & 0xf];
+        y[j+16] = d * kvalues_iq4nl[q4[j] >>  4];
+    }
+}
+#endif
+
+
+// I-quant rows
+
+template<typename dst_t>
+static void dequantize_row_iq2_xxs_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int nb = k / QK_K;
+    dequantize_block_iq2_xxs<<<nb, 32, 0, stream>>>(vx, y);
+}
+
+template<typename dst_t>
+static void dequantize_row_iq2_xs_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int nb = k / QK_K;
+    dequantize_block_iq2_xs<<<nb, 32, 0, stream>>>(vx, y);
+}
+
+template<typename dst_t>
+static void dequantize_row_iq2_s_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int nb = k / QK_K;
+    dequantize_block_iq2_s<<<nb, 32, 0, stream>>>(vx, y);
+}
+
+template<typename dst_t>
+static void dequantize_row_iq3_xxs_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int nb = k / QK_K;
+    dequantize_block_iq3_xxs<<<nb, 32, 0, stream>>>(vx, y);
+}
+
+template<typename dst_t>
+static void dequantize_row_iq3_s_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int nb = k / QK_K;
+    dequantize_block_iq3_s<<<nb, 32, 0, stream>>>(vx, y);
+}
+
+template<typename dst_t>
+static void dequantize_row_iq1_s_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int nb = k / QK_K;
+    dequantize_block_iq1_s<<<nb, 32, 0, stream>>>(vx, y);
+}
+
+template<typename dst_t>
+static void dequantize_row_iq4_nl_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int nb = (k + QK_K - 1) / QK_K;
+    dequantize_block_iq4_nl<<<nb, 32, 0, stream>>>(vx, y);
+}
+
+template<typename dst_t>
+static void dequantize_row_iq1_m_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int nb = k / QK_K;
+    dequantize_block_iq1_m<<<nb, 32, 0, stream>>>(vx, y);
+}
+
+template<typename dst_t>
+static void dequantize_row_iq4_xs_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int nb = (k + QK_K - 1) / QK_K;
+#if QK_K == 64
+    dequantize_block_iq4_nl<<<nb, 32, 0, stream>>>(vx, y);
+#else
+    dequantize_block_iq4_xs<<<nb, 32, 0, stream>>>(vx, y);
+#endif
+}
+
+
 void dequantize_row_q2_K_cuda_fp16(
         const void * vx, ggml_half_placeholder * y, const int64_t k, cudaStream_t stream) {
     dequantize_row_q2_K_cuda(vx, (ggml_half*)y, k, stream);
@@ -341,22 +632,119 @@ void dequantize_row_q6_K_cuda_fp16(
 }
 
 
-void dequantize_row_q2_K_cuda_fp32(const void * vx, float * y, const int64_t k, cudaStream_t stream) {
+void dequantize_row_q2_K_cuda_fp32(
+        const void * vx, float * y, const int64_t k, cudaStream_t stream) {
     dequantize_row_q2_K_cuda(vx, y, k, stream);
 }
 
-void dequantize_row_q3_K_cuda_fp32(const void * vx, float * y, const int64_t k, cudaStream_t stream) {
+void dequantize_row_q3_K_cuda_fp32(
+        const void * vx, float * y, const int64_t k, cudaStream_t stream) {
     dequantize_row_q3_K_cuda(vx, y, k, stream);
 }
 
-void dequantize_row_q4_K_cuda_fp32(const void * vx, float * y, const int64_t k, cudaStream_t stream) {
+void dequantize_row_q4_K_cuda_fp32(
+        const void * vx, float * y, const int64_t k, cudaStream_t stream) {
     dequantize_row_q4_K_cuda(vx, y, k, stream);
 }
 
-void dequantize_row_q5_K_cuda_fp32(const void * vx, float * y, const int64_t k, cudaStream_t stream) {
+void dequantize_row_q5_K_cuda_fp32(
+        const void * vx, float * y, const int64_t k, cudaStream_t stream) {
     dequantize_row_q5_K_cuda(vx, y, k, stream);
 }
 
-void dequantize_row_q6_K_cuda_fp32(const void * vx, float * y, const int64_t k, cudaStream_t stream) {
+void dequantize_row_q6_K_cuda_fp32(
+        const void * vx, float * y, const int64_t k, cudaStream_t stream) {
     dequantize_row_q6_K_cuda(vx, y, k, stream);
+}
+
+
+void dequantize_row_iq2_xxs_cuda_fp16(
+        const void * vx, ggml_half_placeholder * y, const int64_t k, cudaStream_t stream) {
+    dequantize_row_iq2_xxs_cuda(vx, (ggml_half*)y, k, stream);
+}
+
+void dequantize_row_iq2_xs_cuda_fp16(
+        const void * vx, ggml_half_placeholder * y, const int64_t k, cudaStream_t stream) {
+    dequantize_row_iq2_xs_cuda(vx, (ggml_half*)y, k, stream);
+}
+
+void dequantize_row_iq2_s_cuda_fp16(
+        const void * vx, ggml_half_placeholder * y, const int64_t k, cudaStream_t stream) {
+    dequantize_row_iq2_s_cuda(vx, (ggml_half*)y, k, stream);
+}
+
+void dequantize_row_iq3_xxs_cuda_fp16(
+        const void * vx, ggml_half_placeholder * y, const int64_t k, cudaStream_t stream) {
+    dequantize_row_iq3_xxs_cuda(vx, (ggml_half*)y, k, stream);
+}
+
+void dequantize_row_iq3_s_cuda_fp16(
+        const void * vx, ggml_half_placeholder * y, const int64_t k, cudaStream_t stream) {
+    dequantize_row_iq3_s_cuda(vx, (ggml_half*)y, k, stream);
+}
+
+void dequantize_row_iq1_s_cuda_fp16(
+        const void * vx, ggml_half_placeholder * y, const int64_t k, cudaStream_t stream) {
+    dequantize_row_iq1_s_cuda(vx, (ggml_half*)y, k, stream);
+}
+
+void dequantize_row_iq4_nl_cuda_fp16(
+        const void * vx, ggml_half_placeholder * y, const int64_t k, cudaStream_t stream) {
+    dequantize_row_iq4_nl_cuda(vx, (ggml_half*)y, k, stream);
+}
+
+void dequantize_row_iq1_m_cuda_fp16(
+        const void * vx, ggml_half_placeholder * y, const int64_t k, cudaStream_t stream) {
+    dequantize_row_iq1_m_cuda(vx, (ggml_half*)y, k, stream);
+}
+
+void dequantize_row_iq4_xs_cuda_fp16(
+        const void * vx, ggml_half_placeholder * y, const int64_t k, cudaStream_t stream) {
+    dequantize_row_iq4_xs_cuda(vx, (ggml_half*)y, k, stream);
+}
+
+
+void dequantize_row_iq2_xxs_cuda_fp32(
+        const void * vx, float * y, const int64_t k, cudaStream_t stream) {
+    dequantize_row_iq2_xxs_cuda(vx, y, k, stream);
+}
+
+void dequantize_row_iq2_xs_cuda_fp32(
+        const void * vx, float * y, const int64_t k, cudaStream_t stream) {
+    dequantize_row_iq2_xs_cuda(vx, y, k, stream);
+}
+
+void dequantize_row_iq2_s_cuda_fp32(
+        const void * vx, float * y, const int64_t k, cudaStream_t stream) {
+    dequantize_row_iq2_s_cuda(vx, y, k, stream);
+}
+
+void dequantize_row_iq3_xxs_cuda_fp32(
+        const void * vx, float * y, const int64_t k, cudaStream_t stream) {
+    dequantize_row_iq3_xxs_cuda(vx, y, k, stream);
+}
+
+void dequantize_row_iq3_s_cuda_fp32(
+        const void * vx, float * y, const int64_t k, cudaStream_t stream) {
+    dequantize_row_iq3_s_cuda(vx, y, k, stream);
+}
+
+void dequantize_row_iq1_s_cuda_fp32(
+        const void * vx, float * y, const int64_t k, cudaStream_t stream) {
+    dequantize_row_iq1_s_cuda(vx, y, k, stream);
+}
+
+void dequantize_row_iq4_nl_cuda_fp32(
+        const void * vx, float * y, const int64_t k, cudaStream_t stream) {
+    dequantize_row_iq4_nl_cuda(vx, y, k, stream);
+}
+
+void dequantize_row_iq1_m_cuda_fp32(
+        const void * vx, float * y, const int64_t k, cudaStream_t stream) {
+    dequantize_row_iq1_m_cuda(vx, y, k, stream);
+}
+
+void dequantize_row_iq4_xs_cuda_fp32(
+        const void * vx, float * y, const int64_t k, cudaStream_t stream) {
+    dequantize_row_iq4_xs_cuda(vx, y, k, stream);
 }
