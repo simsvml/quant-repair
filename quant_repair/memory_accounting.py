@@ -1,11 +1,13 @@
+from collections import defaultdict
 from dataclasses import dataclass
+import time
 from typing import Iterable
 import weakref
 import torch
 from torch import Tensor
 
 
-DISABLE_MEMORY_ACCOUNTING = True
+DISABLE_MEMORY_ACCOUNTING = False
 
 @dataclass(frozen=True)
 class MemoryAccountingEntry:
@@ -20,6 +22,7 @@ class MemoryAccounting:
         # `id(tensor)` as the key ensures we don't record the same tensor
         # twice.
         self.entries = {}
+        self.log_file = None
 
     @staticmethod
     def disable():
@@ -65,6 +68,9 @@ class MemoryAccounting:
         if DISABLE_MEMORY_ACCOUNTING:
             return
 
+        if self.log_file is None:
+            self.log_file = open('memory_%s.log' % time.strftime('%Y%m%d_%H%M%S'), 'w')
+
         # Bring the `entries` set up to date by removing stale items and adding
         # missing gradient tensors.
         del_keys = []
@@ -95,21 +101,26 @@ class MemoryAccounting:
             sizes[str(entry.device)][entry.desc] += entry.size
 
 
-        print(' === Memory Report ===')
+        def print_(s):
+            print(s)
+            print(s, file = self.log_file, flush = True)
+
+
+        print_(' === Memory Report ===')
         if header is not None:
-            print(header)
+            print_(header)
 
         for device_name, device_sizes in sorted(sizes.items()):
-            print('\nMemory usage for device %s:' % device_name)
+            print_('\nMemory usage for device %s:' % device_name)
             device_total = 0
             for desc, size in sorted(device_sizes.items()):
-                print('  %7.3f GB   %s' % (size / 1024**3, desc))
+                print_('  %7.3f GB   %s' % (size / 1024**3, desc))
                 device_total += size
-            print('  %7.3f GB   Total' % (device_total / 1024**3))
+            print_('  %7.3f GB   Total' % (device_total / 1024**3))
             if device_name.startswith('cuda'):
                 torch_size = torch.cuda.memory_allocated(device_name)
-                print('  %7.3f GB   Total (pytorch reported)' % (torch_size / 1024**3))
+                print_('  %7.3f GB   Total (pytorch reported)' % (torch_size / 1024**3))
                 delta = torch_size - device_total
-                print('  %7.3f GB   Unaccounted' % (delta / 1024**3))
+                print_('  %7.3f GB   Unaccounted' % (delta / 1024**3))
 
 MEMORY_ACCOUNTING = MemoryAccounting()

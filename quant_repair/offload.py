@@ -122,7 +122,8 @@ class TensorOffload:
 
         for entry in self.partition_tensors[partition]:
             entry.tensor_gpu = entry.tensor.to(self.device)
-            MEMORY_ACCOUNTING.register(entry.tensor_gpu, 'offload group %s' % entry.group)
+            #MEMORY_ACCOUNTING.register(entry.tensor_gpu, 'offload group %s' % entry.group)
+            MEMORY_ACCOUNTING.register(entry.tensor_gpu, 'offload partition %d' % partition)
 
         self.current_partition = partition
 

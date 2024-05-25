@@ -1,6 +1,6 @@
 import os
 import re
-import safetensors
+import safetensors.torch
 from typing import Optional, Tuple, Dict, Iterable
 import torch
 from torch import Tensor

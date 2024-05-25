@@ -185,9 +185,11 @@ def main3():
     #add(None, lr = 1.2e-5)
     #add(32, lr = 1.2e-5)
 
-    add(32, lr = 1.27e-5)
+    #add(32, lr = 1.27e-5)
     #add(64, lr = 1.27e-5)
     #add(128, lr = 1.27e-5)
+
+    add(64, lr = 1e-6)
 
     #add(None, 2)
     #add(None, 2.5)
@@ -220,7 +222,10 @@ def main3():
 
     with set_default_dtype(torch.bfloat16):
         #with torch.no_grad():
-            run(configs)
+            try:
+                run(configs)
+            finally:
+                MEMORY_ACCOUNTING.report('exit/crash')
 
 def main4():
     cfgs = []
@@ -258,7 +263,7 @@ def main4():
                 log_file.write('\n')
                 log_file.flush()
 
-main = main4
+main = main3
 
 def run(cfgs):
     if isinstance(cfgs, (dict, type(None))):
@@ -273,7 +278,30 @@ def run(cfgs):
     MEMORY_ACCOUNTING.disable()
 
     device = torch.device('cuda')
-    arch = Llama3Arch.llama3_8b()
+    arch = Llama3Arch.llama3_70b()
+
+
+    # Training config
+    max_seq_len = 1024
+    batch_size = 1
+    total_epochs = 1
+    #max_steps_per_epoch = 3
+    max_steps_per_epoch = 1000
+    #max_steps_per_epoch = 3500      # slimorca: 20M tokens
+    #max_steps_per_epoch = 9000      # slimorca: 50M tokens
+    #max_steps_per_epoch = 18000     # slimorca: 100M tokens
+    #max_steps_per_epoch = 2500
+    gradient_accumulation_steps = 16
+
+    #assert len(cfgs) == 1
+    #cfg = cfgs[0]
+    #max_steps_per_epoch = 1000 * 16 // cfg['batch_factor']
+    #gradient_accumulation_steps = cfg['batch_factor']
+
+    max_samples = gradient_accumulation_steps * max_steps_per_epoch
+
+    superbatch_mem_gb = 8
+    #superbatch_mem_gb = 32
 
 
     print('loading original weights from %r' % (orig_dir,))
@@ -283,8 +311,8 @@ def run(cfgs):
 
     # Offload setup
     print('loading quantized weights from %r' % (quant_dir,))
-    #offload = TensorOffload(device, vram_limit_gb=8)
-    offload = TensorOffload(device, vram_limit_gb=2)
+    offload = TensorOffload(device, vram_limit_gb=10)
+    #offload = TensorOffload(device, vram_limit_gb=2)
 
     offload.add_group('tok_embeddings')
     for i in range(arch.num_layers):
@@ -391,27 +419,6 @@ def run(cfgs):
 
     model_with_lora = make_model(linear_with_lora, embedding_with_lora)
 
-
-    # Training config
-    max_seq_len = 1024
-    batch_size = 1
-    total_epochs = 1
-    #max_steps_per_epoch = 1
-    #max_steps_per_epoch = 1000
-    #max_steps_per_epoch = 3500      # slimorca: 20M tokens
-    #max_steps_per_epoch = 9000      # slimorca: 50M tokens
-    #max_steps_per_epoch = 18000     # slimorca: 100M tokens
-    #max_steps_per_epoch = 2500
-    #gradient_accumulation_steps = 16
-    assert len(cfgs) == 1
-    cfg = cfgs[0]
-    max_steps_per_epoch = 1000 * 16 // cfg['batch_factor']
-    gradient_accumulation_steps = cfg['batch_factor']
-
-    max_samples = gradient_accumulation_steps * max_steps_per_epoch
-
-    #superbatch_mem_gb = 32
-    superbatch_mem_gb = 8
 
     # Set up dataset and loader
     print('loading dataset')
@@ -618,6 +625,15 @@ def train(
     concurrently using the same data and base weights.
     """
 
+    # After every `save_checkpoint_interval` optimizer steps, update the
+    # current checkpoint.
+    save_checkpoint_interval = 10
+    # After saving the current checkpoint file `checkpoint_rotate_interval`
+    # times, rotate to a new checkpoint file, leaving the old one around
+    # permanently.
+    checkpoint_rotate_interval = 2
+
+
     print('initializing trainable parameters')
 
     # Norm scales are initialized from the base model's weights.  LoRA
@@ -706,6 +722,15 @@ def train(
     #)
     kl_div_loss_fn = nn.KLDivLoss(log_target=True, reduction='batchmean')
 
+    def register_optimizer_tensors():
+        MEMORY_ACCOUNTING.register_all(
+            (x for x in optimizer.state_dict().values() if isinstance(x, Tensor)),
+            'optimizer state')
+        MEMORY_ACCOUNTING.register_all(
+            (x for x in lr_scheduler.state_dict().values() if isinstance(x, Tensor)),
+            'lr_scheduler state')
+    register_optimizer_tensors()
+
 
     # Write config to log
     config_dict = {
@@ -721,11 +746,49 @@ def train(
     write_log(config_dict)
 
 
+    # Activation checkpointing and offloading
+    activation_checkpoint_buffer = None
+    activation_shapes = []
+
+    def init_activation_checkpoint_buffer(samples):
+        nonlocal activation_checkpoint_buffer
+        num_samples = len(samples)
+        max_seq_len = max(s.numel() for s in samples)
+        if activation_checkpoint_buffer is not None \
+                and activation_checkpoint_buffer.shape[1] >= num_samples \
+                and activation_checkpoint_buffer.shape[2] >= max_seq_len:
+            return
+
+        del activation_checkpoint_buffer
+        activation_checkpoint_buffer = torch.empty(
+            (arch.num_layers + 1, num_samples, max_seq_len, arch.embed_dim))
+
+    def save_activation_checkpoint(layer_index, activations):
+        for i, act in enumerate(activations):
+            if i >= len(activation_shapes):
+                activation_shapes.append(None)
+            activation_shapes[i] = act.shape
+            act = act.view(-1, arch.embed_dim)
+            activation_checkpoint_buffer[layer_index, i, :act.shape[0], :].copy_(act)
+
+    def load_activation_checkpoint(layer_index, sample_index):
+        out = torch.empty(activation_shapes[sample_index], device=device)
+        out_view = out.view(-1, arch.embed_dim)
+        out_view.copy_(
+            activation_checkpoint_buffer[layer_index, sample_index, :out_view.shape[0], :])
+        return out
+
+
     metrics = {
         'loss': None,
         'lr': None,
         'gpu_resources': None,
     }
+
+    checkpoint_counter = 0
+    num_samples = 0
+
+    MEMORY_ACCOUNTING.report('before training loop (ident = %s)' % ident)
 
     while True:
         # (1) Receive samples
@@ -733,7 +796,8 @@ def train(
         if samples is None:
             break
 
-        activation_checkpoints = []
+        init_activation_checkpoint_buffer(samples)
+        activations = []
 
         # (2) Forward pass steps
         yield
@@ -741,28 +805,35 @@ def train(
             model_with_lora, quant_weights, train_params, device, quant_map)
         activations = [m(sample) for sample in samples]
         MEMORY_ACCOUNTING.register_all(activations, 'activations')
-        activation_checkpoints.append(activations)
+        save_activation_checkpoint(0, activations)
         del m
 
         for i in range(arch.num_layers):
             yield
             m = QRM.llama3_lora.build_trainable_layer(
                 model_with_lora, quant_weights, train_params, i, device, quant_map)
+            # Explicit loop instead of list comprehension ensures only one
+            # extra activation tensor is in memory at a time.
             activations = [m(act) for act in activations]
-            MEMORY_ACCOUNTING.register(activations, 'activations')
-            activation_checkpoints.append(activations)
+            #for j in range(len(activations)):
+            #    activations[j] = m(activations[j])
+            MEMORY_ACCOUNTING.register_all(activations, 'activations')
+            save_activation_checkpoint(i + 1, activations)
             del m
 
         yield
         m = QRM.llama3_lora.build_trainable_norm(
             model_with_lora, quant_weights, train_params, device, quant_map)
-        activations = [m(act) for act in activations]
+        for j in range(len(activations)):
+            activations[j] = m(activations[j])
         MEMORY_ACCOUNTING.register_all(activations, 'activations')
         # Norm output is not recorded as a checkpoint.
         del m
 
         # Final activations are kept around for later use in
         # calc_loss.
+
+        MEMORY_ACCOUNTING.report('after forward pass')
 
         # (3) Before backward pass
         yield
@@ -792,9 +863,12 @@ def train(
             train_embeds = activations[i]
             loss, grad = run_initial_backward_step(train_embeds, calc_loss)
             MEMORY_ACCOUNTING.register(grad, 'backward gradients')
+            activations[i] = None
 
             gradients.append(grad)
             loss_sum += loss.item()
+
+        MEMORY_ACCOUNTING.report('after initial backward pass')
 
         # Loss is already divided by `len(samples)` (which is the number of
         # gradient accumulation steps) inside `calc_loss`.
@@ -806,8 +880,9 @@ def train(
         yield
         m = QRM.llama3_lora.build_trainable_norm(
             model_with_lora, quant_weights, train_params, device, quant_map)
-        for i, act in enumerate(activation_checkpoints.pop()):
-            gradients[i] = run_backward_step(act, gradients[i], m)
+        for j in range(len(samples)):
+            act = load_activation_checkpoint(arch.num_layers, j)
+            gradients[j] = run_backward_step(act, gradients[j], m)
         MEMORY_ACCOUNTING.register_all(gradients, 'backward gradients')
         del m, act
 
@@ -815,7 +890,8 @@ def train(
             yield
             m = QRM.llama3_lora.build_trainable_layer(
                 model_with_lora, quant_weights, train_params, i, device, quant_map)
-            for j, act in enumerate(activation_checkpoints.pop()):
+            for j in range(len(samples)):
+                act = load_activation_checkpoint(i, j)
                 gradients[j] = run_backward_step(act, gradients[j], m)
             MEMORY_ACCOUNTING.register_all(gradients, 'backward gradients')
             del m, act
@@ -823,9 +899,11 @@ def train(
         yield
         m = QRM.llama3_lora.build_trainable_tok_embeddings(
             model_with_lora, quant_weights, train_params, device, quant_map)
-        for i, sample in enumerate(samples):
-            run_final_backward_step(sample, gradients[i], m)
+        for j, sample in enumerate(samples):
+            run_final_backward_step(sample, gradients[j], m)
         del m, sample, gradients
+
+        MEMORY_ACCOUNTING.report('after full backward pass')
 
         # (6) Run optimizer
         yield
@@ -833,44 +911,35 @@ def train(
         optimizer.zero_grad(set_to_none=True)
         lr_scheduler.step()
 
+        register_optimizer_tensors()
+        MEMORY_ACCOUNTING.report('after optimizer')
+
         metrics['loss'] = loss_avg
         metrics['lr'] = optimizer.param_groups[0]["lr"]
         metrics['gpu_resources'] = torch.cuda.memory_allocated()
         write_log(metrics)
 
+        # Maybe save a checkpoint
+        num_samples += len(samples)
+        checkpoint_counter += 1
 
-    state_dict = {}
+        if checkpoint_counter % save_checkpoint_interval == 0:
+            checkpoint = {
+                'params': QRM.llama3_lora.save_trainable_params(train_params),
+                'optimizer': optimizer.state_dict(),
+                'lr_scheduler': lr_scheduler.state_dict(),
+                'num_samples': num_samples,
+            }
+            idx = checkpoint_counter // (save_checkpoint_interval * checkpoint_rotate_interval)
+            checkpoint_path = os.path.join(output_dir, 'repair_lora_%s_ckpt%d.pt' % (ident, idx))
+            torch.save(checkpoint, checkpoint_path)
+            tqdm.write('saved checkpoint %s' % checkpoint_path)
 
-    def save_low_rank_adapter_params(name, params):
-        state_dict[name + '.lora_a'] = params.lora_a
-        state_dict[name + '.lora_b'] = params.lora_b
-        state_dict[name + '.lora_alpha'] = params.lora_alpha
 
-    def save_rms_norm_params(name ,params):
-        state_dict[name + '.scale'] = params.scale
-
-    def save_layer_trainable_params(name, params):
-        save_low_rank_adapter_params(name + '.q_proj', params.q_proj)
-        save_low_rank_adapter_params(name + '.k_proj', params.k_proj)
-        save_low_rank_adapter_params(name + '.v_proj', params.v_proj)
-        save_low_rank_adapter_params(name + '.output_proj', params.output_proj)
-        save_low_rank_adapter_params(name + '.gate_proj', params.gate_proj)
-        save_low_rank_adapter_params(name + '.down_proj', params.down_proj)
-        save_low_rank_adapter_params(name + '.up_proj', params.up_proj)
-        save_rms_norm_params(name + '.sa_norm', params.sa_norm)
-        save_rms_norm_params(name + '.mlp_norm', params.mlp_norm)
-
-    def save_trainable_params(name, params):
-        save_low_rank_adapter_params(name + '.tok_embeddings', params.tok_embeddings)
-        for i, layer_params in enumerate(params.layers):
-            save_layer_trainable_params('%s.layers.%d' % (name, i), layer_params)
-        save_rms_norm_params(name + '.norm', params.norm)
-        save_low_rank_adapter_params(name + '.output', params.output)
-
-    save_trainable_params('params', train_params)
-    checkpoint_path = os.path.join(output_dir, 'repair_ckpt_%s.pt' % ident)
-    torch.save(state_dict, checkpoint_path)
-    print('\nsaved %s' % checkpoint_path)
+    state_dict = QRM.llama3_lora.save_trainable_params(train_params)
+    lora_path = os.path.join(output_dir, 'repair_lora_%s.pt' % ident)
+    torch.save(state_dict, lora_path)
+    print('\nsaved %s' % lora_path)
 
 
 if __name__ == '__main__':

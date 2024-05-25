@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Tuple, List, Dict, Callable
+from typing import Any, Tuple, List, Dict, Callable
 from torch import Tensor
 from torchtune.modules.quantized import UNQUANTIZED_TYPES
 from .. import functional as QRF
@@ -157,6 +157,38 @@ def load_trainable_params(loader, num_layers, device) -> TrainableParams:
         )
 
     return load_trainable_params('params')
+
+def save_trainable_params(params: TrainableParams) -> Dict[str, Any]:
+    state_dict = {}
+
+    def save_low_rank_adapter_params(name, params):
+        state_dict[name + '.lora_a'] = params.lora_a
+        state_dict[name + '.lora_b'] = params.lora_b
+        state_dict[name + '.lora_alpha'] = params.lora_alpha
+
+    def save_rms_norm_params(name ,params):
+        state_dict[name + '.scale'] = params.scale
+
+    def save_layer_trainable_params(name, params):
+        save_low_rank_adapter_params(name + '.q_proj', params.q_proj)
+        save_low_rank_adapter_params(name + '.k_proj', params.k_proj)
+        save_low_rank_adapter_params(name + '.v_proj', params.v_proj)
+        save_low_rank_adapter_params(name + '.output_proj', params.output_proj)
+        save_low_rank_adapter_params(name + '.gate_proj', params.gate_proj)
+        save_low_rank_adapter_params(name + '.down_proj', params.down_proj)
+        save_low_rank_adapter_params(name + '.up_proj', params.up_proj)
+        save_rms_norm_params(name + '.sa_norm', params.sa_norm)
+        save_rms_norm_params(name + '.mlp_norm', params.mlp_norm)
+
+    def save_trainable_params(name, params):
+        save_low_rank_adapter_params(name + '.tok_embeddings', params.tok_embeddings)
+        for i, layer_params in enumerate(params.layers):
+            save_layer_trainable_params('%s.layers.%d' % (name, i), layer_params)
+        save_rms_norm_params(name + '.norm', params.norm)
+        save_low_rank_adapter_params(name + '.output', params.output)
+
+    save_trainable_params('params', params)
+    return state_dict
 
 
 def build_trainable_tok_embeddings(
