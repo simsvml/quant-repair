@@ -8,6 +8,7 @@ from torch import Tensor
 
 
 DISABLE_MEMORY_ACCOUNTING = False
+DISABLE_PRINT = False
 
 @dataclass(frozen=True)
 class MemoryAccountingEntry:
@@ -28,6 +29,11 @@ class MemoryAccounting:
     def disable():
         global DISABLE_MEMORY_ACCOUNTING
         DISABLE_MEMORY_ACCOUNTING = True
+
+    @staticmethod
+    def disable_print():
+        global DISABLE_PRINT
+        DISABLE_PRINT = True
 
     def register(self, tensor, desc):
         if DISABLE_MEMORY_ACCOUNTING:
@@ -102,7 +108,8 @@ class MemoryAccounting:
 
 
         def print_(s):
-            print(s)
+            if not DISABLE_PRINT:
+                print(s)
             print(s, file = self.log_file, flush = True)
 
 

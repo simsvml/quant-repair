@@ -19,7 +19,7 @@ def read_file(f):
         loss.append(metrics['loss'])
         lr.append(metrics['lr'])
 
-    WINDOW_SIZE = 80
+    WINDOW_SIZE = 20
 
     if len(loss) < WINDOW_SIZE:
         return loss, []
@@ -48,6 +48,9 @@ plt.grid(visible=True, axis='y')
 for path in sys.argv[1:]:
     loss, loss_avg = read_file(open(path))
     ax.plot(loss_avg, label=os.path.basename(path))
+    #ax.plot(loss, label=os.path.basename(path))
+    if len(loss_avg) > 0:
+        print(os.path.basename(path), loss_avg[-1])
 
 ax.legend()
 plt.show()

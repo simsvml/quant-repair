@@ -8,6 +8,17 @@ from gguf import GGMLQuantizationType
 import torch_ggml_quant
 
 
+UNQUANTIZED_TYPES = {
+        GGMLQuantizationType.F16,
+        GGMLQuantizationType.F32,
+        GGMLQuantizationType.F64,
+        GGMLQuantizationType.I8,
+        GGMLQuantizationType.I16,
+        GGMLQuantizationType.I32,
+        GGMLQuantizationType.I64,
+        }
+
+
 @dataclass(frozen=True)
 class DequantizeParams:
     quant: GGMLQuantizationType
@@ -15,11 +26,15 @@ class DequantizeParams:
     dtype: Optional[torch.dtype] = None
 
     def apply(self, x: Tensor) -> Tensor:
+        dtype = self.dtype if self.dtype is not None else torch.get_default_dtype()
+
+        if self.quant in UNQUANTIZED_TYPES:
+            assert x.shape == self.shape
+            return x.to(dtype)
+
         x = x.view(-1, torch_ggml_quant.quant_format_block_size(self.quant))
         k = torch_ggml_quant.quant_format_values_per_block(self.quant)
         buf_shape = (x.shape[0], k)
-
-        dtype = self.dtype if self.dtype is not None else torch.get_default_dtype()
 
         if x.device.type == 'cpu':
             buf = torch.empty(buf_shape, device=x.device, dtype=torch.float32)
