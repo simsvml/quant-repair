@@ -34,7 +34,7 @@ class SuperbatchEmbeddings:
         return len(self._batches)
 
     def append(self, batch: Tensor):
-        assert batch.shape[-1] == self._embed_dim
+        assert batch.shape[-1] == self._embed_dim, 'bad batch shape %r' % (batch.shape,)
         shape = batch.shape[:-1]
         new_tokens = shape.numel()
         assert new_tokens <= self.tokens_free()

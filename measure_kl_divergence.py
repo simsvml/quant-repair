@@ -32,8 +32,8 @@ from quant_repair.model_util.llama3_lora import TrainableParams, LayerTrainableP
 from quant_repair.model_util.superbatch import run_forward_superbatch2
 from quant_repair.modules import LowRankAdapter, QuantLowRankAdapter, WithAdapter
 from quant_repair.offload import TensorOffload
-from quant_repair.weights import load_weights_safetensors_hf, \
-    CheckpointStateDict, QuantizedCheckpointLoader
+import quant_repair.loader
+from quant_repair.loader import StateDictLoader, SafetensorsLoader, GGUFLoader
 
 
 def main():
@@ -43,8 +43,8 @@ def main():
 
 def run():
     assert len(sys.argv) in (3, 4)
-    orig_dir = sys.argv[1]
-    quant_dir = sys.argv[2]
+    orig_path = sys.argv[1]
+    quant_path = sys.argv[2]
     if len(sys.argv) >= 4:
         lora_path = sys.argv[3]
     else:
@@ -53,67 +53,54 @@ def run():
     MEMORY_ACCOUNTING.disable()
 
     device = torch.device('cuda')
-    arch = Llama3Arch.llama3_8b()
+    arch = Llama3Arch.llama3_70b()
 
-    print('loading original weights from %r' % (orig_dir,))
-    orig_state_dict = load_weights_safetensors_hf(orig_dir, arch)
-    orig_weights = CheckpointStateDict(orig_state_dict)
+    print('loading original weights from %r' % (orig_path,))
+    orig_loader = SafetensorsLoader(orig_path,
+        convert = quant_repair.loader.hf_conversion(arch))
+    assert orig_loader.has('layers.%d.attn.q_proj.weight' % (arch.num_layers - 1)), \
+            'architecture mismatch: %r is missing layers' % orig_path
+    assert not orig_loader.has('layers.%d.attn.q_proj.weight' % arch.num_layers), \
+            'architecture mismatch: %r has too many layers' % orig_path
 
-    print('loading quantized weights from %r' % (quant_dir,))
-    quant_weights = QuantizedCheckpointLoader(quant_dir, dequant_device=device)
+    print('loading quantized weights from %r' % (quant_path,))
+    quant_loader = GGUFLoader(quant_path,
+        convert = quant_repair.loader.llama_cpp_conversion())
+    assert quant_loader.has('layers.%d.attn.q_proj.weight' % (arch.num_layers - 1)), \
+            'architecture mismatch: %r is missing layers' % quant_path
+    assert not quant_loader.has('layers.%d.attn.q_proj.weight' % arch.num_layers), \
+            'architecture mismatch: %r has too many layers' % quant_path
 
     if lora_path is not None:
         print('loading trained lora from %r' % (lora_path,))
-        lora_state_dict = torch.load(lora_path, weights_only=True)
-        lora_weights = CheckpointStateDict(lora_state_dict)
+        lora_state_dict = torch.load(lora_path)
+        if 'params' in lora_state_dict:
+            lora_state_dict = lora_state_dict['params']
+        lora_loader = StateDictLoader(lora_state_dict)
         lora_params = QRM.llama3_lora.load_trainable_params(
-            lora_weights, arch.num_layers, device)
+            lora_loader, arch.num_layers, device)
     else:
-        lora_weights = None
         lora_params = None
 
-    tokenizer_json_path = os.path.join(orig_dir, 'tokenizer.json')
+    if os.path.isdir(orig_path):
+        orig_dir = orig_path
+    else:
+        orig_dir = os.path.dirname(orig_path)
+    tokenizer_json_path = os.path.join(orig_path, 'tokenizer.json')
     print('loading tokenizer from %s' % tokenizer_json_path)
     tokenizer = llama3_tokenizer_transformers(tokenizer_json_path)
 
 
     # Build llama3 model
-    rope = RotaryPositionalEmbeddings(
-        dim = arch.head_dim(),
-        max_seq_len = arch.max_seq_len,
-        base = arch.rope_base,
-    ).to(device)
-    def make_model(make_linear, make_embedding):
-        return QRF.TransformerDecoder(
-            tok_embeddings = make_embedding(),
-            layers = [
-                QRF.TransformerDecoderLayer(
-                    attn = QRF.CausalSelfAttention(
-                        embed_dim = arch.embed_dim,
-                        num_heads = arch.num_heads,
-                        num_kv_heads = arch.num_kv_heads,
-                        head_dim = arch.head_dim(),
-                        q_proj = make_linear(),
-                        k_proj = make_linear(),
-                        v_proj = make_linear(),
-                        output_proj = make_linear(),
-                        pos_embeddings = rope,
-                    ),
-                    mlp = QRF.FeedForward(
-                        gate_proj = make_linear(),
-                        down_proj = make_linear(),
-                        up_proj = make_linear(),
-                        activation = nn.SiLU(),
-                    ),
-                    sa_norm = QRF.RMSNorm(eps = arch.norm_eps),
-                    mlp_norm = QRF.RMSNorm(eps = arch.norm_eps),
-                ) for i in range(arch.num_layers)
-            ],
-            norm = QRF.RMSNorm(eps = arch.norm_eps),
-            output = make_linear(),
-        )
+    model_common = QRM.llama3.ModelCommon(
+        rope = RotaryPositionalEmbeddings(
+            dim = arch.head_dim(),
+            max_seq_len = arch.max_seq_len,
+            base = arch.rope_base,
+        ).to(device),
+    )
 
-    model = make_model(QRF.Linear, QRF.Embedding)
+    model = QRM.llama3.make_model(arch, model_common)
 
     def embedding_with_lora():
         base = QRF.Embedding()
@@ -125,14 +112,16 @@ def run():
         adapter = QRF.LowRankAdapter()
         return QRF.WithAdapter(base, adapter)
 
-    model_with_lora = make_model(linear_with_lora, embedding_with_lora)
+    model_with_lora = QRM.llama3.make_model(
+        arch, model_common, linear_with_lora, embedding_with_lora)
 
 
     # Training config
     max_seq_len = 1024
     batch_size = 1
     total_epochs = 1
-    max_steps_per_epoch = 9000
+    max_steps_per_epoch = 0
+    #max_steps_per_epoch = 9000
     #max_steps_per_epoch = 2500
     #max_steps_per_epoch = 1000
     #max_steps_per_epoch = 2500
@@ -200,9 +189,9 @@ def run():
                 superbatch_samples,
                 embeds_orig,
                 arch.num_layers,
-                lambda: QRM.llama3.build_forward_tok_embeddings(model, orig_weights, device),
-                lambda i: QRM.llama3.build_forward_layer(model, orig_weights, i, device),
-                lambda: QRM.llama3.build_forward_norm(model, orig_weights, device),
+                lambda: QRM.llama3.build_forward_tok_embeddings(model, orig_loader, device),
+                lambda i: QRM.llama3.build_forward_layer(model, orig_loader, i, device),
+                lambda: QRM.llama3.build_forward_norm(model, orig_loader, device),
                 device,
                 pbar_forward = pbar_superbatch_forward,
                 pbar_layer = pbar_superbatch_layer,
@@ -216,27 +205,27 @@ def run():
                     superbatch_samples,
                     embeds_quant,
                     arch.num_layers,
-                    lambda: QRM.llama3.build_forward_tok_embeddings(model, quant_weights, device),
-                    lambda i: QRM.llama3.build_forward_layer(model, quant_weights, i, device),
-                    lambda: QRM.llama3.build_forward_norm(model, quant_weights, device),
+                    lambda: QRM.llama3.build_forward_tok_embeddings(model, quant_loader, device),
+                    lambda i: QRM.llama3.build_forward_layer(model, quant_loader, i, device),
+                    lambda: QRM.llama3.build_forward_norm(model, quant_loader, device),
                     device,
                     pbar_forward = pbar_superbatch_forward,
                     pbar_layer = pbar_superbatch_layer,
                 )
                 pbar_quant.update(len(superbatch_samples))
 
-                m_quant = QRM.llama3.build_forward_output(model, quant_weights, device)
+                m_quant = QRM.llama3.build_forward_output(model, quant_loader, device)
             else:
                 run_forward_superbatch2(
                     superbatch_samples,
                     embeds_quant,
                     arch.num_layers,
                     lambda: QRM.llama3_lora.build_trainable_tok_embeddings(
-                        model_with_lora, quant_weights, lora_params, device),
+                        model_with_lora, quant_loader, lora_params, device),
                     lambda i: QRM.llama3_lora.build_trainable_layer(
-                        model_with_lora, quant_weights, lora_params, i, device),
+                        model_with_lora, quant_loader, lora_params, i, device),
                     lambda: QRM.llama3_lora.build_trainable_norm(
-                        model_with_lora, quant_weights, lora_params, device),
+                        model_with_lora, quant_loader, lora_params, device),
                     device,
                     pbar_forward = pbar_superbatch_forward,
                     pbar_layer = pbar_superbatch_layer,
@@ -244,11 +233,11 @@ def run():
                 pbar_quant.update(len(superbatch_samples))
 
                 m_quant = QRM.llama3_lora.build_trainable_output(
-                    model_with_lora, quant_weights, lora_params, device)
+                    model_with_lora, quant_loader, lora_params, device)
 
             MEMORY_ACCOUNTING.report('after quant superbatch')
 
-            m_orig = QRM.llama3.build_forward_output(model, orig_weights, device)
+            m_orig = QRM.llama3.build_forward_output(model, orig_loader, device)
 
             for i in range(len(superbatch_samples)):
                 orig_logits = m_orig(embeds_orig[i].to(device))
@@ -286,39 +275,6 @@ def run():
         print('loss = %.6e' % (loss_sum / loss_count))
 
     MEMORY_ACCOUNTING.report('after training loop')
-
-
-#    state_dict = {}
-#
-#    def save_low_rank_adapter_params(name, params):
-#        state_dict[name + '.lora_a'] = params.lora_a
-#        state_dict[name + '.lora_b'] = params.lora_b
-#
-#    def save_rms_norm_params(name ,params):
-#        state_dict[name + '.scale'] = params.scale
-#
-#    def save_layer_trainable_params(name, params):
-#        save_low_rank_adapter_params(name + '.q_proj', params.q_proj)
-#        save_low_rank_adapter_params(name + '.k_proj', params.k_proj)
-#        save_low_rank_adapter_params(name + '.v_proj', params.v_proj)
-#        save_low_rank_adapter_params(name + '.output_proj', params.output_proj)
-#        save_low_rank_adapter_params(name + '.gate_proj', params.gate_proj)
-#        save_low_rank_adapter_params(name + '.down_proj', params.down_proj)
-#        save_low_rank_adapter_params(name + '.up_proj', params.up_proj)
-#        save_rms_norm_params(name + '.sa_norm', params.sa_norm)
-#        save_rms_norm_params(name + '.mlp_norm', params.mlp_norm)
-#
-#    def save_trainable_params(name, params):
-#        save_low_rank_adapter_params(name + '.tok_embeddings', params.tok_embeddings)
-#        for i, layer_params in enumerate(params.layers):
-#            save_layer_trainable_params('%s.layers.%d' % (name, i), layer_params)
-#        save_rms_norm_params(name + '.norm', params.norm)
-#        save_low_rank_adapter_params(name + '.output', params.output)
-#
-#    save_trainable_params('params', train_params)
-#    checkpoint_path = os.path.join(quant_dir, 'repair_ckpt.pt')
-#    torch.save(state_dict, checkpoint_path)
-#    print('\n\nsaved %s' % checkpoint_path)
 
 
 if __name__ == '__main__':

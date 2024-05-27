@@ -16,7 +16,30 @@ UNQUANTIZED_TYPES = {
         GGMLQuantizationType.I16,
         GGMLQuantizationType.I32,
         GGMLQuantizationType.I64,
+        GGMLQuantizationType.BF16,
         }
+
+UNQUANTIZED_TORCH_DTYPE = {
+    GGMLQuantizationType.F16: torch.float16,
+    GGMLQuantizationType.F32: torch.float32,
+    GGMLQuantizationType.F64: torch.float64,
+    GGMLQuantizationType.I8: torch.int8,
+    GGMLQuantizationType.I16: torch.int16,
+    GGMLQuantizationType.I32: torch.int32,
+    GGMLQuantizationType.I64: torch.int64,
+    GGMLQuantizationType.BF16: torch.bfloat16,
+}
+
+TORCH_DTYPE_TO_QUANT = {
+    torch.float16: GGMLQuantizationType.F16,
+    torch.float32: GGMLQuantizationType.F32,
+    torch.float64: GGMLQuantizationType.F64,
+    torch.int8: GGMLQuantizationType.I8,
+    torch.int16: GGMLQuantizationType.I16,
+    torch.int32: GGMLQuantizationType.I32,
+    torch.int64: GGMLQuantizationType.I64,
+    torch.bfloat16: GGMLQuantizationType.BF16,
+}
 
 
 @dataclass(frozen=True)
@@ -28,9 +51,9 @@ class DequantizeParams:
     def apply(self, x: Tensor) -> Tensor:
         dtype = self.dtype if self.dtype is not None else torch.get_default_dtype()
 
-        if self.quant in UNQUANTIZED_TYPES:
-            assert x.shape == self.shape
-            return x.to(dtype)
+        if (unquant_dtype := UNQUANTIZED_TORCH_DTYPE.get(self.quant)) is not None:
+            assert x.dtype == unquant_dtype
+            return x.view(self.shape).to(dtype)
 
         x = x.view(-1, torch_ggml_quant.quant_format_block_size(self.quant))
         k = torch_ggml_quant.quant_format_values_per_block(self.quant)

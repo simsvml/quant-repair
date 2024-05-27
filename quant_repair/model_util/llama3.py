@@ -1,8 +1,10 @@
+from dataclasses import dataclass
 from typing import Callable
 from torch import Tensor
+from torch import nn
+from torchtune.modules import RotaryPositionalEmbeddings
 from .. import functional as QRF
 from ..memory_accounting import MEMORY_ACCOUNTING
-from .misc import weights_getter
 
 
 def build_forward_tok_embeddings(
@@ -10,7 +12,7 @@ def build_forward_tok_embeddings(
     loader,
     device,
 ) -> Callable[[Tensor], Tensor]:
-    get1 = weights_getter(loader, device)
+    get1 = lambda key: loader.get(key, device = device)
     params = QRF.EmbeddingParams(get1('tok_embeddings.weight'))
     MEMORY_ACCOUNTING.register_params(params, 'build_forward_tok_embeddings params')
     def run(x):
@@ -23,7 +25,7 @@ def build_forward_layer(
     layer_index: int,
     device,
 ) -> Callable[[Tensor], Tensor]:
-    get1 = weights_getter(loader, device)
+    get1 = lambda key: loader.get(key, device = device)
     i = layer_index
     params = QRF.TransformerDecoderLayerParams(
         attn = QRF.CausalSelfAttentionParams(
@@ -50,7 +52,7 @@ def build_forward_norm(
     loader,
     device,
 ) -> Callable[[Tensor], Tensor]:
-    get1 = weights_getter(loader, device)
+    get1 = lambda key: loader.get(key, device = device)
     params = QRF.RMSNormParams(get1('norm.scale'))
     MEMORY_ACCOUNTING.register_params(params, 'build_forward_norm params')
     def run(x):
@@ -62,9 +64,49 @@ def build_forward_output(
     loader,
     device,
 ) -> Callable[[Tensor], Tensor]:
-    get1 = weights_getter(loader, device)
+    get1 = lambda key: loader.get(key, device = device)
     params = QRF.LinearParams(get1('output.weight'))
     MEMORY_ACCOUNTING.register_params(params, 'build_forward_output params')
     def run(x):
         return model.output.run(params, x)
     return run
+
+
+@dataclass
+class ModelCommon:
+    rope: RotaryPositionalEmbeddings
+
+def make_model(
+    arch,
+    common: ModelCommon,
+    make_linear = QRF.Linear,
+    make_embedding = QRF.Embedding,
+) -> QRF.TransformerDecoder:
+    return QRF.TransformerDecoder(
+        tok_embeddings = make_embedding(),
+        layers = [
+            QRF.TransformerDecoderLayer(
+                attn = QRF.CausalSelfAttention(
+                    embed_dim = arch.embed_dim,
+                    num_heads = arch.num_heads,
+                    num_kv_heads = arch.num_kv_heads,
+                    head_dim = arch.head_dim(),
+                    q_proj = make_linear(),
+                    k_proj = make_linear(),
+                    v_proj = make_linear(),
+                    output_proj = make_linear(),
+                    pos_embeddings = common.rope,
+                ),
+                mlp = QRF.FeedForward(
+                    gate_proj = make_linear(),
+                    down_proj = make_linear(),
+                    up_proj = make_linear(),
+                    activation = nn.SiLU(),
+                ),
+                sa_norm = QRF.RMSNorm(eps = arch.norm_eps),
+                mlp_norm = QRF.RMSNorm(eps = arch.norm_eps),
+            ) for i in range(arch.num_layers)
+        ],
+        norm = QRF.RMSNorm(eps = arch.norm_eps),
+        output = make_linear(),
+    )

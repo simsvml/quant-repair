@@ -8,86 +8,76 @@ from quant_repair import quantized
 
 
 @dataclass(frozen=True)
-class EmbeddingParams:
-    weight: Tensor
+class TensorParams:
+    data: Tensor
+    dequant: quantized.DequantizeParams
+
+    @classmethod
+    def from_unquantized_tensor(cls, x: Tensor) -> 'TensorParams':
+        dq = quantized.DequantizeParams(
+            quant = quantized.TORCH_DTYPE_TO_QUANT[x.dtype],
+            shape = x.shape,
+            dtype = x.dtype,
+        )
+        return TensorParams(data = x, dequant = dq)
 
     def tensors(self):
-        yield self.weight
+        yield self.data
+
+    def get(self) -> Tensor:
+        return self.dequant.apply(self.data)
+
+
+@dataclass(frozen=True)
+class EmbeddingParams:
+    weight: TensorParams
+
+    def tensors(self):
+        yield from self.weight.tensors()
 
 @dataclass(frozen=True)
 class Embedding:
     def run(self, params: EmbeddingParams, x: Tensor) -> Tensor:
-        return F.embedding(x, params.weight)
+        return F.embedding(x, params.weight.get())
 
 
 @dataclass(frozen=True)
 class LinearParams:
-    weight: Tensor
-    bias: Optional[Tensor] = None
+    weight: TensorParams
+    bias: Optional[TensorParams] = None
 
     def tensors(self):
-        yield self.weight
+        yield from self.weight.tensors()
         if self.bias is not None:
-            yield self.bias
+            yield from self.bias.tensors()
 
 @dataclass(frozen=True)
 class Linear:
     def run(self, params: LinearParams, x: Tensor) -> Tensor:
-        return F.linear(x, params.weight, params.bias)
-
-
-@dataclass(frozen=True)
-class QuantEmbeddingParams:
-    weight: Tensor
-    weight_dequant: quantized.DequantizeParams
-
-    def tensors(self):
-        yield self.weight
-
-@dataclass(frozen=True)
-class QuantEmbedding:
-    def run(self, params: QuantEmbeddingParams, x: Tensor) -> Tensor:
-        return quantized.quant_embedding(x, params.weight, params.weight_dequant)
-
-
-@dataclass(frozen=True)
-class QuantLinearParams:
-    weight: Tensor
-    weight_dequant: quantized.DequantizeParams
-    bias: Optional[Tensor] = None
-    bias_dequant: Optional[quantized.DequantizeParams] = None
-
-    def tensors(self):
-        yield self.weight
-        if self.bias is not None:
-            yield self.bias
-
-@dataclass(frozen=True)
-class QuantLinear:
-    def run(self, params: QuantLinearParams, x: Tensor) -> Tensor:
-        return quantized.quant_linear(x, params.weight, params.weight_dequant,
-            params.bias, params.bias_dequant)
+        bias = params.bias.get() if params.bias is not None else None
+        return F.linear(x, params.weight.get(), bias)
 
 
 @dataclass(frozen=True)
 class RMSNormParams:
-    scale: Tensor
+    scale: TensorParams
 
     def tensors(self):
-        yield self.scale
+        yield from self.scale.tensors()
 
 @dataclass(frozen=True)
 class RMSNorm:
     eps: float = 1e-6
 
     def run(self, params: RMSNormParams, x: Tensor) -> Tensor:
-        assert params.scale.dtype == x.dtype, \
-            'scale dtype %s should match input dtype %s' % (params.scale.dtype, x.dtype)
+        scale = params.scale.get()
+        assert scale.dtype == x.dtype, \
+            'scale dtype %s should match input dtype %s' % (scale.dtype, x.dtype)
         x_fp32 = x.float()
         x_normed = (
             x_fp32 * torch.rsqrt(x_fp32.pow(2).mean(-1, keepdim=True) + self.eps)
         ).type_as(x)
-        return x_normed * params.scale
+        return x_normed * scale
 
 
 @dataclass(frozen=True)
@@ -300,13 +290,13 @@ class WithAdapter:
 
 @dataclass(frozen=True)
 class LowRankAdapterParams:
-    lora_a: Tensor
-    lora_b: Tensor
+    lora_a: TensorParams
+    lora_b: TensorParams
     lora_alpha: float = 1.0
 
     def tensors(self):
-        yield self.lora_a
-        yield self.lora_b
+        yield from self.lora_a.tensors()
+        yield from self.lora_b.tensors()
 
 @dataclass(frozen=True)
 class LowRankAdapter:
@@ -315,8 +305,8 @@ class LowRankAdapter:
     def run(self, params: LowRankAdapterParams, x: Tensor) -> Tensor:
         if self.dropout != 0.0:
             x = F.dropout(x, self.dropout)
-        x = F.linear(x, params.lora_a)
-        x = F.linear(x, params.lora_b)
+        x = F.linear(x, params.lora_a.get())
+        x = F.linear(x, params.lora_b.get())
         # https://arxiv.org/abs/2404.09610 "LoRA Dropout as a Sparsity
         # Regularizer for Overfitting Control" drops rows and columns in both A
         # and B, along the non-rank dimension only (to avoid reducing rank).
@@ -329,21 +319,21 @@ class LowRankAdapter:
 
 @dataclass(frozen=True)
 class EmbeddingLowRankAdapterParams:
-    lora_a: Tensor
-    lora_b: Tensor
+    lora_a: TensorParams
+    lora_b: TensorParams
     lora_alpha: float = 1.0
 
     def tensors(self):
-        yield self.lora_a
-        yield self.lora_b
+        yield from self.lora_a.tensors()
+        yield from self.lora_b.tensors()
 
 @dataclass(frozen=True)
 class EmbeddingLowRankAdapter:
     dropout: float = 0.0
 
     def run(self, params: EmbeddingLowRankAdapterParams, x: Tensor) -> Tensor:
-        x = F.embedding(x, params.lora_a.t())
-        x = F.linear(x, params.lora_b)
+        x = F.embedding(x, params.lora_a.get().t())
+        x = F.linear(x, params.lora_b.get())
         if self.dropout != 0.0:
             x = F.dropout(x, self.dropout)
         return x * params.lora_alpha
