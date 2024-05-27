@@ -1,3 +1,4 @@
+import dataclasses
 from dataclasses import dataclass
 import itertools
 import json
@@ -28,6 +29,13 @@ from quant_repair.offload import TensorOffload
 from quant_repair.quantized import DequantizeParams
 from quant_repair.weights import load_weights_safetensors_hf, CheckpointStateDict
 
+
+def config_as_dict(x) -> dict:
+    if dataclasses.is_dataclass(x):
+        d = dataclasses.asdict(x)
+        return {k: config_as_dict(v) for k, v in d.items()}
+    else:
+        return x
 
 @dataclass(frozen = True)
 class TrainConfig:
@@ -327,6 +335,7 @@ def run_init(config_path, checkpoint_path):
     print('loading config from %r' % config_path)
     cfg_dict = tomllib.load(open(config_path, 'rb'))
     cfg = Config.from_dict(cfg_dict)
+    cfg_dict = config_as_dict(cfg)
 
     if os.path.exists(checkpoint_path):
         print('Output file %r already exists' % checkpoint_path)
@@ -441,6 +450,7 @@ def run_train(checkpoint_path):
     checkpoint_dict = torch.load(checkpoint_path)
     cfg_dict = checkpoint_dict['cfg']
     cfg = Config.from_dict(cfg_dict)
+    cfg_dict = config_as_dict(cfg)
 
     arch = get_model_arch(cfg.model_arch)
     device = torch.device('cuda')
