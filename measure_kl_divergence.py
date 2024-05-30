@@ -120,7 +120,8 @@ def run():
     max_seq_len = 1024
     batch_size = 1
     total_epochs = 1
-    max_steps_per_epoch = 0
+    #max_steps_per_epoch = 0
+    max_steps_per_epoch = 4000
     #max_steps_per_epoch = 9000
     #max_steps_per_epoch = 2500
     #max_steps_per_epoch = 1000
@@ -134,7 +135,7 @@ def run():
 
 
     # Test config
-    test_steps = 300
+    test_steps = 500
 
 
     # Set up dataset and loader

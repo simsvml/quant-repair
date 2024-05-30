@@ -4,7 +4,27 @@ import sys
 import matplotlib.pyplot as plt
 
 
+def exp_smooth(xs, alpha = 0.2):
+    cur = None
+    for x in xs:
+        if cur is None:
+            cur = x
+        else:
+            cur = alpha * x + (1 - alpha) * cur
+        yield cur
 
+def sliding_window(xs, size):
+    if len(xs) < size:
+        return []
+
+    avg = []
+    acc = sum(xs[:size])
+    avg.append(acc / len(xs[:size]))
+    for i in range(size, len(xs)):
+        acc += xs[i]
+        acc -= xs[i - size]
+        avg.append(acc / size)
+    return avg
 
 def read_file(f):
     loss = []
@@ -19,20 +39,7 @@ def read_file(f):
         loss.append(metrics['loss'])
         lr.append(metrics['lr'])
 
-    WINDOW_SIZE = 20
-
-    if len(loss) < WINDOW_SIZE:
-        return loss, []
-
-    loss_avg = []
-    acc = sum(loss[:WINDOW_SIZE])
-    loss_avg.append(acc / len(loss[:WINDOW_SIZE]))
-    for i in range(WINDOW_SIZE, len(loss)):
-        acc += loss[i]
-        acc -= loss[i - WINDOW_SIZE]
-        loss_avg.append(acc / WINDOW_SIZE)
-
-    return loss, loss_avg
+    return loss
 
 
 fig, ax = plt.subplots()
@@ -46,13 +53,21 @@ plt.grid(visible=True, axis='y')
 #ax.plot(range(WINDOW_SIZE//2, WINDOW_SIZE//2 + len(loss_avg)), loss_avg)
 
 for path in sys.argv[1:]:
-    loss, loss_avg = read_file(open(path))
-    ax.plot(loss_avg, label=os.path.basename(path))
+    loss = read_file(open(path))
+    if len(loss) == 0:
+        continue
+    #loss2 = list(exp_smooth(loss, alpha = 0.05))
+    #loss3 = list(exp_smooth(loss2, alpha = 0.01))
+    loss2 = list(sliding_window(loss, size = 250))
     #ax.plot(loss, label=os.path.basename(path))
-    if len(loss_avg) > 0:
-        print(os.path.basename(path), loss_avg[-1])
+    ax.plot(loss2, label=os.path.basename(path))
+    #ax.plot(loss3, label=os.path.basename(path))
+    print(os.path.basename(path), loss2[-1])
+    #ax.plot(loss, label=os.path.basename(path))
 
 ax.legend()
+fig.set_tight_layout(True)
+fig.savefig('graph.png')
 plt.show()
 
 
