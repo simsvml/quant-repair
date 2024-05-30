@@ -811,6 +811,127 @@ def run_train(checkpoint_path):
     save_checkpoint()
 
 
+def run_extract_config(checkpoint_path):
+    # Disable printing the final memory report.  The report normally goes to
+    # stdout, which would interfere with redirecting the config toml to a file.
+    MEMORY_ACCOUNTING.disable()
+
+    print('loading checkpoint from %r' % checkpoint_path, file=sys.stderr)
+    checkpoint_dict = torch.load(checkpoint_path, map_location = 'meta')
+    cfg_dict = checkpoint_dict['cfg']
+    cfg = Config.from_dict(cfg_dict)
+
+    lines = []
+    def emit(line):
+        lines.append(line)
+
+    def emit_toml_key_value(key, value, prefix=''):
+        if value is None:
+            emit('# %s = UNSET' % key)
+        elif isinstance(value, (int, float, str)):
+            emit('%s = %r' % (key, value))
+        elif isinstance(value, dict):
+            emit('\n[%s%s]' % (prefix, key))
+            emit_dict_toml(value, prefix = '%s%s.' % (prefix, key))
+        elif dataclasses.is_dataclass(value):
+            emit('\n[%s%s]' % (prefix, key))
+            emit_cfg_toml(value, prefix = '%s%s.' % (prefix, key))
+        else:
+            raise TypeError('emit_cfg_toml: unknown type %r' % type(value))
+
+    def emit_toml_table(items, prefix=''):
+        subtables = []
+        for key, value in items:
+            if isinstance(value, dict) or dataclasses.is_dataclass(value):
+                subtables.append((key, value))
+            else:
+                emit_toml_key_value(key, value, prefix = prefix)
+        for key, value in subtables:
+            emit_toml_key_value(key, value, prefix = prefix)
+
+    def emit_cfg_toml(c, prefix=''):
+        emit_toml_table(
+            ((field.name, getattr(c, field.name)) for field in dataclasses.fields(type(c))),
+            prefix = prefix)
+
+    def emit_dict_toml(d, prefix=''):
+        emit_toml_table(d.items(), prefix = prefix)
+
+    emit_cfg_toml(cfg)
+
+    toml_str = '\n'.join(lines)
+    cfg_dict_orig = config_as_dict(cfg)
+    cfg_dict_reparsed = tomllib.loads(toml_str)
+    assert cfg_dict_orig == cfg_dict_reparsed, \
+            "sanity check failed - printed TOML doesn't match original"
+
+    print(toml_str)
+
+def run_update_config(checkpoint_path, config_path):
+    print('loading checkpoint from %r' % checkpoint_path)
+    checkpoint_dict = torch.load(checkpoint_path, map_location = 'meta')
+    old_cfg_dict = checkpoint_dict['cfg']
+    old_cfg = Config.from_dict(old_cfg_dict)
+    old_cfg_dict = config_as_dict(old_cfg)
+
+    print('loading config from %r' % config_path)
+    new_cfg_dict = tomllib.load(open(config_path, 'rb'))
+    new_cfg = Config.from_dict(new_cfg_dict)
+    new_cfg_dict = config_as_dict(new_cfg)
+
+    if old_cfg_dict == new_cfg_dict:
+        print('Configs already match; nothing to do')
+        return
+
+    def flatten_dict(d, out = None, prefix = ''):
+        if out is None:
+            out = {}
+
+        for key, value in d.items():
+            if isinstance(value, dict):
+                flatten_dict(value, out = out, prefix = '%s%s.' % (prefix, key))
+            else:
+                key_ext = prefix + key
+                assert key_ext not in out, 'duplicate key %r' % key_ext
+                out[key_ext] = value
+
+        return out
+
+    old_flat = flatten_dict(old_cfg_dict)
+    new_flat = flatten_dict(new_cfg_dict)
+
+    print('\nChanges:')
+    all_keys = set(old_flat.keys()) | set(new_flat.keys())
+    for key in sorted(all_keys):
+        # `key` can't be missing from both dicts, since in that case it
+        # wouldn't be present in `all_keys`.
+        if key not in old_flat:
+            print('  %s: UNSET -> %r' % (key, new_flat[key]))
+        elif key not in new_flat:
+            print('  %s: %r -> UNSET' % (key, old_flat[key]))
+        else:
+            old_value = old_flat[key]
+            new_value = new_flat[key]
+            if old_value != new_value:
+                print('  %s: %r -> %r' % (key, old_value, new_value))
+
+    print()
+    answer = input('Apply these changes? ')
+    if answer.lower() not in ('y', 'yes'):
+        print('Operation cancelled')
+        return
+
+    checkpoint_dict['cfg'] = new_cfg_dict
+    torch.save(checkpoint_dict, checkpoint_path)
+    print('updated %r' % checkpoint_path)
+
+
+
+
+
+
+
+
 def main():
     assert len(sys.argv) >= 2
     mode = sys.argv[1]
@@ -831,6 +952,15 @@ def main():
             checkpoint_path = sys.argv[3]
             run_init(config_path, checkpoint_path)
             run_train(checkpoint_path)
+        elif mode == 'extract_config':
+            assert len(sys.argv) == 3
+            checkpoint_path = sys.argv[2]
+            run_extract_config(checkpoint_path)
+        elif mode == 'update_config':
+            assert len(sys.argv) == 4
+            checkpoint_path = sys.argv[2]
+            config_path = sys.argv[3]
+            run_update_config(checkpoint_path, config_path)
         else:
             raise ValueError('unknown mode %r' % mode)
     finally:
