@@ -1,13 +1,17 @@
 from dataclasses import dataclass
 import torch
 from torch import Tensor
-from typing import Optional, Dict, Iterable
+from typing import Any, Optional, Dict, Iterable
+from . import functional as QRF
 from .memory_accounting import MEMORY_ACCOUNTING
+from . import quantized
+from .functional import TensorParams
 
 
 @dataclass
 class TensorOffloadEntry:
     tensor: Tensor
+    dequant: quantized.DequantizeParams
     tensor_gpu: Optional[Tensor]
     name: str
     group: str
@@ -30,11 +34,12 @@ class TensorOffload:
     tensor is retrieved, all tensors in its partition (which at minimum
     includes all tensors in the same group) will be moved to VRAM.
     """
-    def __init__(self, device, vram_limit_gb):
+    def __init__(self, device, vram_limit_gb, metadata=None):
         self.device = device
         self.vram_limit = int(vram_limit_gb * 1024 ** 3)
         self.tensors = {}
         self.groups = []
+        self.metadata = metadata if metadata is not None else {}
 
         # For each partition, this has a list of tensors in that partition.
         self.partition_tensors = []
@@ -43,10 +48,17 @@ class TensorOffload:
     def add_group(self, group_name):
         self.groups.append(group_name)
 
-    def add_tensor(self, group_name, tensor_name, tensor, read_only=False):
+    def add_tensor(
+        self,
+        group_name: str,
+        tensor_name: str,
+        tensor: QRF.TensorParams,
+        read_only=False,
+    ):
         assert tensor_name not in self.tensors, 'duplicate tensor %r' % (tensor_name,)
         self.tensors[tensor_name] = TensorOffloadEntry(
-            tensor = tensor.to('cpu'),
+            tensor = tensor.data.to('cpu'),
+            dequant = tensor.dequant,
             tensor_gpu = None,
             name = tensor_name,
             group = group_name,
@@ -130,43 +142,20 @@ class TensorOffload:
     def get(
         self,
         key: str,
-        result_key: Optional[str] = None,
-        dequant: bool = False,
-    ) -> Dict[str, Tensor]:
-        if result_key is None:
-            result_key = key
-
-        partition = self.tensors[key].partition
-        if partition != self.current_partition:
-            self._load_partition(partition)
-        assert self.tensors[key].tensor_gpu is not None
-        return {result_key: self.tensors[key].tensor_gpu}
-
-    def get_multi(
-        self,
-        keys: Iterable[str],
-        result_keys: Optional[str] = None,
-        dequant: bool = False,
-    ) -> Dict[str, Tensor]:
-        if result_keys is not None:
-            keys_iter = zip(keys, result_keys, strict=True)
-        else:
-            keys_iter = ((k, k) for k in keys)
-
-        result = {}
-        first_partition = None
-        for key, result_key in keys_iter:
-            partition = self.tensors[key].partition
-            if first_partition is None:
-                first_partition = partition
-            else:
-                if partition != first_partition:
-                    # We could optimize this case, but it's unlikely to occur.
-                    print('warning: get_multi spans multiple partitions; this will be slow')
+        device: Optional[torch.device] = None,
+    ) -> TensorParams:
+        t = self.tensors[key]
+        if device is None or device == self.device:
+            partition = t.partition
             if partition != self.current_partition:
                 self._load_partition(partition)
-            assert self.tensors[key].tensor_gpu is not None
-            result[result_key] = self.tensors[key].tensor_gpu
+            assert t.tensor_gpu is not None
+            return TensorParams(data = t.tensor_gpu, dequant = t.dequant)
+        elif device == torch.device('cpu'):
+            return TensorParams(data = t.tensor, dequant = t.dequant)
+        else:
+            raise ValueError('bad device %r: expected cpu or %r' % (device, self.device))
 
-        return result
+    def get_meta(self, key: str) -> Any:
+        return self.metadata[key]
 

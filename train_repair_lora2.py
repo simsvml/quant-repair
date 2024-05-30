@@ -21,13 +21,14 @@ from quant_repair.architecture import Llama3Arch
 from quant_repair.datasets import load_slimorca_dataset, load_wikitext_dataset
 from quant_repair.forward import SuperbatchEmbeddings
 from quant_repair import functional as QRF
+import quant_repair.loader
+from quant_repair.loader import StateDictLoader, SafetensorsLoader, GGUFLoader
 from quant_repair.memory_accounting import MEMORY_ACCOUNTING
 from quant_repair import model_util as QRM
 from quant_repair.model_util.llama3_lora import TrainableParams, LayerTrainableParams
 from quant_repair.model_util.superbatch import run_forward_superbatch
 from quant_repair.offload import TensorOffload
 from quant_repair.quantized import DequantizeParams
-from quant_repair.weights import load_weights_safetensors_hf, CheckpointStateDict
 
 
 def config_as_dict(x) -> dict:
@@ -238,46 +239,6 @@ def build_dataset(cfg, tokenizer):
         raise ValueError('unknown dataset %r' % (name,))
 
 
-@dataclass
-class ModelCommon:
-    rope: RotaryPositionalEmbeddings
-
-def make_model(
-    arch,
-    common: ModelCommon,
-    make_linear = QRF.Linear,
-    make_embedding = QRF.Embedding,
-) -> QRF.TransformerDecoder:
-    return QRF.TransformerDecoder(
-        tok_embeddings = make_embedding(),
-        layers = [
-            QRF.TransformerDecoderLayer(
-                attn = QRF.CausalSelfAttention(
-                    embed_dim = arch.embed_dim,
-                    num_heads = arch.num_heads,
-                    num_kv_heads = arch.num_kv_heads,
-                    head_dim = arch.head_dim(),
-                    q_proj = make_linear(),
-                    k_proj = make_linear(),
-                    v_proj = make_linear(),
-                    output_proj = make_linear(),
-                    pos_embeddings = common.rope,
-                ),
-                mlp = QRF.FeedForward(
-                    gate_proj = make_linear(),
-                    down_proj = make_linear(),
-                    up_proj = make_linear(),
-                    activation = nn.SiLU(),
-                ),
-                sa_norm = QRF.RMSNorm(eps = arch.norm_eps),
-                mlp_norm = QRF.RMSNorm(eps = arch.norm_eps),
-            ) for i in range(arch.num_layers)
-        ],
-        norm = QRF.RMSNorm(eps = arch.norm_eps),
-        output = make_linear(),
-    )
-
-
 def run_backward_step(
     x: Tensor,
     grad_y: Tensor,
@@ -350,23 +311,8 @@ def run_init(config_path, checkpoint_path):
     torch.set_default_dtype(torch.bfloat16)
 
 
-    gguf_reader = GGUFReader(cfg.quant_weights_gguf_path)
-    gguf_tensors = {t.name: t for t in gguf_reader.tensors}
-
-    def gguf_get(key):
-        t = gguf_tensors[key]
-
-        shape_length = max((j + 1 for j, dim in enumerate(t.shape) if dim != 1),
-            default=len(t.shape))
-        shape = tuple(int(x) for x in reversed(t.shape[:shape_length]))
-
-        dq = DequantizeParams(
-            quant = t.tensor_type,
-            shape = shape,
-        )
-
-        x = torch.from_numpy(t.data).to(device)
-        return dq.apply(x)
+    quant_loader = GGUFLoader(cfg.quant_weights_gguf_path,
+        convert = quant_repair.loader.llama_cpp_conversion())
 
 
     # Initialize trainable params
@@ -384,8 +330,10 @@ def run_init(config_path, checkpoint_path):
         #rank = rank_map[key]
         rank = cfg.model.lora_rank
         return QRF.LowRankAdapterParams(
-            lora_a = torch.empty((rank, n), dtype=dtype, device=device).normal_(),
-            lora_b = torch.zeros((m, rank), dtype=dtype, device=device),
+            lora_a = QRF.TensorParams.from_unquantized_tensor(
+                torch.empty((rank, n), dtype=dtype, device=device).normal_()),
+            lora_b = QRF.TensorParams.from_unquantized_tensor(
+                torch.zeros((m, rank), dtype=dtype, device=device)),
             lora_alpha = lora_alpha / rank,
         )
 
@@ -405,16 +353,16 @@ def run_init(config_path, checkpoint_path):
             down_proj = init_lora_params('layers.%d.mlp.w2' % layer_index),
             up_proj = init_lora_params('layers.%d.mlp.w3' % layer_index),
             sa_norm = QRF.RMSNormParams(
-                gguf_get('blk.%d.attn_norm.weight' % layer_index)),
+                quant_loader.get('layers.%d.sa_norm.scale' % layer_index)),
             mlp_norm = QRF.RMSNormParams(
-                gguf_get('blk.%d.ffn_norm.weight' % layer_index)),
+                quant_loader.get('layers.%d.mlp_norm.scale' % layer_index)),
         )
 
     def init_train_params() -> TrainableParams:
         return TrainableParams(
             tok_embeddings = init_lora_params('tok_embeddings'),
             layers = [init_layer_params(i) for i in range(arch.num_layers)],
-            norm = QRF.RMSNormParams(gguf_get('output_norm.weight')),
+            norm = QRF.RMSNormParams(quant_loader.get('norm.scale')),
             output = init_lora_params('output'),
         )
 
@@ -429,10 +377,6 @@ def run_init(config_path, checkpoint_path):
 
 
     checkpoint_dict = {
-        # TODO: Instead of saving `cfg_dict`, convert `cfg` to a dict and save
-        # that.  `cfg` has default values filled in for all fields, and saving
-        # those would ensure that changing the defaults in the script doesn't
-        # break old checkpoints.
         'cfg': cfg_dict,
         'params': QRM.llama3_lora.save_trainable_params(train_params),
         'optimizer': optimizer.state_dict(),
@@ -460,15 +404,14 @@ def run_train(checkpoint_path):
 
 
     print('loading original weights from %r' % (cfg.orig_weights_safetensors_dir,))
-    orig_state_dict = load_weights_safetensors_hf(cfg.orig_weights_safetensors_dir, arch)
-    orig_weights = CheckpointStateDict(orig_state_dict)
+    orig_loader = SafetensorsLoader(cfg.orig_weights_safetensors_dir,
+        convert = quant_repair.loader.hf_conversion(arch))
 
 
     # Offload setup
     print('loading quantized weights from %r' % (cfg.quant_weights_gguf_path,))
-    gguf_reader = GGUFReader(cfg.quant_weights_gguf_path)
-    gguf_tensors = {t.name: t for t in gguf_reader.tensors}
-    gguf_quant_map = {}
+    quant_loader_raw = GGUFLoader(cfg.quant_weights_gguf_path,
+        convert = quant_repair.loader.llama_cpp_conversion())
 
     offload = TensorOffload(device, vram_limit_gb=cfg.memory.weights_vram_gb)
 
@@ -479,50 +422,46 @@ def run_train(checkpoint_path):
     offload.add_group('output')
 
     def offload_init_tensors():
-        def add_weight(group, name, gguf_name):
+        def add_weight(group, name):
             full_name = '%s.%s' % (group, name)
+            tensor = quant_loader_raw.get(full_name, device = 'cpu')
+            offload.add_tensor(group, full_name, tensor, read_only=True)
 
-            tensor = gguf_tensors[gguf_name]
-            shape_length = max((j + 1 for j, dim in enumerate(tensor.shape) if dim != 1),
-                default=len(tensor.shape))
-            shape = tuple(int(x) for x in reversed(tensor.shape[:shape_length]))
-            gguf_quant_map[full_name] = DequantizeParams(
-                quant = tensor.tensor_type,
-                shape = shape,
-            )
-
-            torch_tensor = torch.from_numpy(tensor.data)
-            offload.add_tensor(group, full_name, torch_tensor, read_only=True)
-
-        add_weight('tok_embeddings', 'weight', 'token_embd.weight')
+        add_weight('tok_embeddings', 'weight')
         for i in range(arch.num_layers):
-            add_weight('layers.%d' % i, 'attn.q_proj.weight', 'blk.%d.attn_q.weight' % i)
-            add_weight('layers.%d' % i, 'attn.k_proj.weight', 'blk.%d.attn_k.weight' % i)
-            add_weight('layers.%d' % i, 'attn.v_proj.weight', 'blk.%d.attn_v.weight' % i)
-            add_weight('layers.%d' % i, 'attn.output_proj.weight', 'blk.%d.attn_output.weight' % i)
-            add_weight('layers.%d' % i, 'mlp.w1.weight', 'blk.%d.ffn_gate.weight' % i)
-            add_weight('layers.%d' % i, 'mlp.w2.weight', 'blk.%d.ffn_down.weight' % i)
-            add_weight('layers.%d' % i, 'mlp.w3.weight', 'blk.%d.ffn_up.weight' % i)
-            add_weight('layers.%d' % i, 'sa_norm.scale', 'blk.%d.attn_norm.weight' % i)
-            add_weight('layers.%d' % i, 'mlp_norm.scale', 'blk.%d.ffn_norm.weight' % i)
-        add_weight('norm', 'scale', 'output_norm.weight')
-        add_weight('output', 'weight', 'output.weight')
+            add_weight('layers.%d' % i, 'attn.q_proj.weight')
+            add_weight('layers.%d' % i, 'attn.k_proj.weight')
+            add_weight('layers.%d' % i, 'attn.v_proj.weight')
+            add_weight('layers.%d' % i, 'attn.output_proj.weight')
+            add_weight('layers.%d' % i, 'mlp.w1.weight')
+            add_weight('layers.%d' % i, 'mlp.w2.weight')
+            add_weight('layers.%d' % i, 'mlp.w3.weight')
+            add_weight('layers.%d' % i, 'sa_norm.scale')
+            add_weight('layers.%d' % i, 'mlp_norm.scale')
+        add_weight('norm', 'scale')
+        add_weight('output', 'weight')
     offload_init_tensors()
 
     offload.build_partitions()
 
     # Use `offload` for fetching base model weights.
-    quant_weights = offload
+    quant_loader = offload
 
 
-    tokenizer_json_path = os.path.join(cfg.orig_weights_safetensors_dir, 'tokenizer.json')
+    if os.path.isdir(cfg.orig_weights_safetensors_dir):
+        orig_dir = cfg.orig_weights_safetensors_dir
+    else:
+        orig_dir = os.path.dirname(cfg.orig_weights_safetensors_dir)
+    tokenizer_json_path = os.path.join(orig_dir, 'tokenizer.json')
     print('loading tokenizer from %s' % tokenizer_json_path)
     tokenizer = llama3_tokenizer_transformers(tokenizer_json_path)
 
 
     print('loading params from checkpoint')
-    param_weights = CheckpointStateDict(checkpoint_dict['params'])
-    train_params = QRM.llama3_lora.load_trainable_params(param_weights, arch.num_layers, device)
+    param_loader = StateDictLoader(checkpoint_dict['params'])
+    with torch.no_grad():
+        train_params = QRM.llama3_lora.load_trainable_params(
+            param_loader, arch.num_layers, device)
     MEMORY_ACCOUNTING.register_params(train_params, 'trainable params')
 
 
@@ -566,28 +505,29 @@ def run_train(checkpoint_path):
     del checkpoint_dict
 
 
-    model_common = ModelCommon(
+    model_common = QRM.llama3.ModelCommon(
         rope = RotaryPositionalEmbeddings(
             dim = arch.head_dim(),
             max_seq_len = arch.max_seq_len,
             base = arch.rope_base,
         ).to(device),
     )
-    model = make_model(arch, model_common, QRF.Linear, QRF.Embedding)
+    model = QRM.llama3.make_model(arch, model_common)
 
     lora_dropout = cfg.model.lora_dropout
 
     def embedding_with_lora():
-        base = QRF.QuantEmbedding()
+        base = QRF.Embedding()
         adapter = QRF.EmbeddingLowRankAdapter(dropout = lora_dropout)
         return QRF.WithAdapter(base, adapter)
 
     def linear_with_lora():
-        base = QRF.QuantLinear()
+        base = QRF.Linear()
         adapter = QRF.LowRankAdapter(dropout = lora_dropout)
         return QRF.WithAdapter(base, adapter)
 
-    model_with_lora = make_model(arch, model_common, linear_with_lora, embedding_with_lora)
+    model_with_lora = QRM.llama3.make_model(
+        arch, model_common, linear_with_lora, embedding_with_lora)
 
 
     # Activation checkpointing and offloading
@@ -700,7 +640,7 @@ def run_train(checkpoint_path):
 
         run_forward_superbatch(
             model,
-            orig_weights,
+            orig_loader,
             superbatch_samples,
             embeds_orig,
             device,
@@ -727,7 +667,7 @@ def run_train(checkpoint_path):
 
             with torch.no_grad():
                 m = QRM.llama3_lora.build_trainable_tok_embeddings(
-                    model_with_lora, quant_weights, train_params, device, gguf_quant_map)
+                    model_with_lora, quant_loader, train_params, device)
                 activations = [m(sample) for sample in samples]
                 MEMORY_ACCOUNTING.register_all(activations, 'activations')
                 save_activation_checkpoint(0, activations)
@@ -736,7 +676,7 @@ def run_train(checkpoint_path):
 
                 for i in range(arch.num_layers):
                     m = QRM.llama3_lora.build_trainable_layer(
-                        model_with_lora, quant_weights, train_params, i, device, gguf_quant_map)
+                        model_with_lora, quant_loader, train_params, i, device)
                     # Explicit loop instead of list comprehension ensures only one
                     # extra activation tensor is in memory at a time.
                     #activations = [m(act) for act in activations]
@@ -748,7 +688,7 @@ def run_train(checkpoint_path):
                     pbar_train_forward.update()
 
                 m = QRM.llama3_lora.build_trainable_norm(
-                    model_with_lora, quant_weights, train_params, device, gguf_quant_map)
+                    model_with_lora, quant_loader, train_params, device)
                 for j in range(len(activations)):
                     activations[j] = m(activations[j])
                 MEMORY_ACCOUNTING.register_all(activations, 'activations')
@@ -762,9 +702,9 @@ def run_train(checkpoint_path):
             MEMORY_ACCOUNTING.report('after train forward pass')
 
             # Run loss forward and backward
-            m_orig = QRM.llama3.build_forward_output(model, orig_weights, device)
+            m_orig = QRM.llama3.build_forward_output(model, orig_loader, device)
             m_train = QRM.llama3_lora.build_trainable_output(
-                model_with_lora, quant_weights, train_params, device, gguf_quant_map)
+                model_with_lora, quant_loader, train_params, device)
 
             # Sum of loss values (used only for logging).
             loss_sum = 0.0
@@ -808,7 +748,7 @@ def run_train(checkpoint_path):
             del m_orig, m_train
 
             m = QRM.llama3_lora.build_trainable_norm(
-                model_with_lora, quant_weights, train_params, device, gguf_quant_map)
+                model_with_lora, quant_loader, train_params, device)
             for j in range(len(samples)):
                 act = load_activation_checkpoint(arch.num_layers, j)
                 gradients[j] = run_backward_step(act, gradients[j], m)
@@ -818,7 +758,7 @@ def run_train(checkpoint_path):
 
             for i in reversed(range(arch.num_layers)):
                 m = QRM.llama3_lora.build_trainable_layer(
-                    model_with_lora, quant_weights, train_params, i, device, gguf_quant_map)
+                    model_with_lora, quant_loader, train_params, i, device)
                 for j in range(len(samples)):
                     act = load_activation_checkpoint(i, j)
                     gradients[j] = run_backward_step(act, gradients[j], m)
@@ -827,7 +767,7 @@ def run_train(checkpoint_path):
                 pbar_train_backward.update()
 
             m = QRM.llama3_lora.build_trainable_tok_embeddings(
-                model_with_lora, quant_weights, train_params, device, gguf_quant_map)
+                model_with_lora, quant_loader, train_params, device)
             for j, sample in enumerate(samples):
                 run_final_backward_step(sample, gradients[j], m)
             del m, sample, gradients
