@@ -13,12 +13,13 @@ import torch
 from torch import Tensor
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.data import DataLoader
 from torchtune.models.llama3 import llama3_tokenizer_transformers
 from torchtune.modules import RotaryPositionalEmbeddings
 from gguf import GGUFReader
 from tqdm import tqdm
 from quant_repair.architecture import Llama3Arch
-from quant_repair.datasets import load_slimorca_dataset, load_wikitext_dataset
+from quant_repair import datasets
 from quant_repair.forward import SuperbatchEmbeddings
 from quant_repair import functional as QRF
 import quant_repair.loader
@@ -221,22 +222,13 @@ def build_lr_schedule(cfg, optimizer):
 def build_dataset(cfg, tokenizer):
     name = cfg.dataset.name
     if name == 'slimorca':
-        return load_slimorca_dataset(
-            tokenizer=tokenizer,
-            max_seq_len=cfg.train.max_seq_len,
-            train_on_input=True,
-            seed=cfg.dataset.shuffle_seed,
-            batch_size=1,
-        )
+        dataset = datasets.load_slimorca_dataset(tokenizer, cfg.train.max_seq_len)
     elif name == 'wikitext':
-        return load_wikitext_dataset(
-            tokenizer = tokenizer,
-            max_seq_len = cfg.train.max_seq_len,
-            seed = cfg.dataset.shuffle_seed,
-            batch_size = 1,
-        )
+        dataset = datasets.load_wikitext_dataset(tokenizer, cfg.train.max_seq_len)
     else:
         raise ValueError('unknown dataset %r' % (name,))
+
+    return dataset.shuffle(seed = cfg.dataset.shuffle_seed)
 
 
 def run_backward_step(
@@ -481,11 +473,6 @@ def run_train(checkpoint_path):
     register_optimizer_tensors()
 
 
-    # Set up dataset and loader
-    print('loading dataset')
-    sampler, dataloader = build_dataset(cfg, tokenizer)
-
-
     timestamp = time.strftime('%Y%m%d_%H%M%S')
     log_file_path = checkpoint_path + '.train_%s.log' % timestamp
     print('writing log to %r' % log_file_path)
@@ -503,6 +490,15 @@ def run_train(checkpoint_path):
 
 
     del checkpoint_dict
+
+
+    # Set up dataset and loader
+    print('loading dataset')
+    dataset = build_dataset(cfg, tokenizer)
+    if progress['samples'] > 0:
+        print('skipping %d samples that were already processed' % progress['samples'])
+        dataset = dataset.skip(progress['samples'])
+    dataloader = DataLoader(dataset)
 
 
     model_common = QRM.llama3.ModelCommon(
@@ -582,10 +578,7 @@ def run_train(checkpoint_path):
         shutil.copyfile(checkpoint_path, path)
 
 
-    sampler.set_epoch(0)
-    samples_iter = (tokens for tokens, labels in dataloader)
-    # TODO: better strategy for skipping initial steps
-    samples_iter = itertools.islice(samples_iter, cfg.dataset.skip + progress['samples'], None)
+    samples_iter = iter(dataloader)
 
     embeds_orig = SuperbatchEmbeddings(arch, ram_gb = cfg.memory.superbatch_ram_gb)
     superbatch_limit = embeds_orig.tokens_free()

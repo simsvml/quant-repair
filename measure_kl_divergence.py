@@ -15,6 +15,7 @@ import torch
 from torch import Tensor
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.data import DataLoader
 from torchtune.models.llama3 import llama3_tokenizer_transformers
 from torchtune.modules import quantized, lr_schedulers
 from torchtune.modules import RotaryPositionalEmbeddings
@@ -22,7 +23,7 @@ from torchtune.utils import set_default_dtype
 from gguf import GGMLQuantizationType
 from quant_repair.architecture import Llama3Arch
 from quant_repair.common import build_module, load_weights, init_lora_weights
-from quant_repair.datasets import load_slimorca_dataset, load_wikitext_dataset
+from quant_repair import datasets
 from quant_repair.forward import SuperbatchEmbeddings, sized_chunks
 from quant_repair import functional as QRF
 from quant_repair.memory_accounting import MEMORY_ACCOUNTING
@@ -121,7 +122,7 @@ def run():
     batch_size = 1
     total_epochs = 1
     #max_steps_per_epoch = 0
-    max_steps_per_epoch = 4000
+    max_steps_per_epoch = 5000
     #max_steps_per_epoch = 9000
     #max_steps_per_epoch = 2500
     #max_steps_per_epoch = 1000
@@ -140,13 +141,16 @@ def run():
 
     # Set up dataset and loader
     print('loading dataset')
-    sampler, dataloader = load_slimorca_dataset(
-        tokenizer=tokenizer,
-        max_seq_len=max_seq_len,
-        train_on_input=True,
-        seed=0,
-        batch_size=batch_size,
-    )
+    dataset = datasets.load_slimorca_dataset(tokenizer, 1024) \
+        .shuffle().skip(max_samples).take(test_steps)
+    dataloader = DataLoader(dataset)
+    #sampler, dataloader = load_slimorca_dataset(
+    #    tokenizer=tokenizer,
+    #    max_seq_len=max_seq_len,
+    #    train_on_input=True,
+    #    seed=0,
+    #    batch_size=batch_size,
+    #)
     #sampler, dataloader = load_wikitext_dataset(
     #    tokenizer = tokenizer,
     #    max_seq_len = max_seq_len,
@@ -163,11 +167,7 @@ def run():
 
     # Match indentation of train_repair_lora_streaming.py
     if True:
-        sampler.set_epoch(0)
-
-        samples_iter = (tokens for tokens, labels in dataloader)
-        print('skipping %d samples' % max_samples)
-        samples_iter = itertools.islice(samples_iter, max_samples, max_samples + test_steps)
+        samples_iter = iter(dataloader)
 
         embeds_orig = SuperbatchEmbeddings(arch, ram_gb=superbatch_mem_gb / 2)
         embeds_quant = SuperbatchEmbeddings(arch, ram_gb=superbatch_mem_gb / 2)

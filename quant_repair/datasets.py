@@ -1,92 +1,146 @@
 from functools import partial
-from typing import Optional, Any, Dict, Tuple, List, Mapping
+from typing import Optional, Any, Dict, Tuple, List, Mapping, Callable
 from datasets import load_dataset
+import torch
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
-from torchtune.datasets import slimorca_dataset
+from torchtune.data import sharegpt_to_llama2_messages
 from torchtune.modules.tokenizers import Tokenizer
-from torchtune.utils import padded_collate
 
 
-class TextDataset(Dataset):
+class DatasetAdapter(Dataset):
+    def __init__(self, dataset: Dataset):
+        self._dataset = dataset
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+
+    def __getitem__(self, index: int) -> Any:
+        return self._dataset[index]
+
+    def map(self, func) -> 'MapDatasetAdapter':
+        return MapDatasetAdapter(self, func)
+
+    def shuffle(self, seed: int = 0) -> 'ShuffleDatasetAdapter':
+        return ShuffleDatasetAdapter(self, seed)
+
+    def skip(self, n: int) -> 'SkipDatasetAdapter':
+        return SkipDatasetAdapter(self, n)
+
+    def take(self, n: int) -> 'TakeDatasetAdapter':
+        return TakeDatasetAdapter(self, n)
+
+    def reversed(self) -> 'ReversedDatasetAdapter':
+        return ReversedDatasetAdapter(self)
+
+class MapDatasetAdapter(DatasetAdapter):
     def __init__(
         self,
-        tokenizer: Tokenizer,
-        source: str,
-        max_seq_len: Optional[int] = None,
-        **load_dataset_kwargs: Dict[str, Any],
-    ) -> None:
-        self._tokenizer = tokenizer
-        self._data = load_dataset(source, **load_dataset_kwargs)
-        self.max_seq_len = max_seq_len
+        dataset: Dataset,
+        func: Callable,
+    ):
+        super().__init__(dataset)
+        self._func = func
 
-    def __len__(self):
-        return len(self._data)
+    def __getitem__(self, index: int) -> Any:
+        return self._func(super().__getitem__(index))
 
-    def __getitem__(self, index: int) -> Tuple[List[int], List[int]]:
-        sample = self._data[index]
-        return self._prepare_sample(sample)
+class ShuffleDatasetAdapter(DatasetAdapter):
+    def __init__(
+        self,
+        dataset: Dataset,
+        seed: int = 0,
+    ):
+        super().__init__(dataset)
+        g = torch.Generator()
+        g.manual_seed(seed)
+        self._order = torch.randperm(len(dataset), generator = g, device = 'cpu').tolist()
 
-    def _prepare_sample(self, sample: Mapping[str, Any]) -> Tuple[List[int], List[int]]:
-        tokens = self._tokenizer.encode(sample['text'], add_bos=True, add_eos=False)
-        if len(tokens) > self.max_seq_len:
-            tokens = tokens[:self.max_seq_len]
+    def __getitem__(self, index: int) -> Any:
+        shuffled_index = self._order[index]
+        return super().__getitem__(shuffled_index)
 
-        # Wherever mask == True, set to CROSS_ENTROPY_IGNORE_IDX. Otherwise keep as tokens
-        #labels = list(np.where(mask, CROSS_ENTROPY_IGNORE_IDX, tokens))
-        #assert len(tokens) == len(labels)
-        labels = tokens
+class SkipDatasetAdapter(DatasetAdapter):
+    def __init__(
+        self,
+        dataset: Dataset,
+        skip: int,
+    ):
+        super().__init__(dataset)
+        self._skip = skip
 
-        return tokens, labels
+    def __len__(self) -> int:
+        return max(0, super().__len__() - self._skip)
 
-def build_data_loader(
-    dataset: Dataset,
+    def __getitem__(self, index: int) -> Any:
+        return super().__getitem__(index + self._skip)
+
+class TakeDatasetAdapter(DatasetAdapter):
+    def __init__(
+        self,
+        dataset: Dataset,
+        take: int,
+    ):
+        super().__init__(dataset)
+        self._take = take
+
+    def __len__(self) -> int:
+        return min(super().__len__(), self._take)
+
+class ReversedDatasetAdapter(DatasetAdapter):
+    def __init__(
+        self,
+        dataset: Dataset,
+    ):
+        super().__init__(dataset)
+
+    def __getitem__(self, index: int) -> Any:
+        rev_index = super().__len__() - 1 - index
+        return super().__getitem__(rev_index)
+
+
+def make_tokenize_func(
     tokenizer: Tokenizer,
-    batch_size: int,
-    seed: int = 0,
-) -> Tuple[DistributedSampler, DataLoader]:
-    sampler = DistributedSampler(
-        dataset,
-        num_replicas=1,
-        rank=0,
-        shuffle=True,
-        seed=seed,
-    )
-    dataloader = DataLoader(
-        dataset=dataset,
-        sampler=sampler,
-        batch_size=batch_size,
-        collate_fn=partial(
-            padded_collate,
-            padding_idx=tokenizer.pad_id,
-            #ignore_idx=loss_fn.ignore_index,
-            ignore_idx=-100,
-        ),
-    )
-    return sampler, dataloader
+    max_seq_len: int,
+) -> Callable[[str], List[int]]:
+    def tokenize_func(text: str) -> List[int]:
+        tokens = tokenizer.encode(text, add_bos=True, add_eos=False)
+        tokens = tokens[:max_seq_len]
+        return torch.tensor(tokens, dtype = torch.int32, device = 'cpu')
+    return tokenize_func
+
+def make_sharegpt_chat_tokenize_func(
+    tokenizer: Tokenizer,
+    max_seq_len: int,
+    train_on_input: bool = True,
+) -> Callable[[str], List[int]]:
+    def sharegpt_chat_tokenize_func(x: dict) -> List[int]:
+        messages = sharegpt_to_llama2_messages(x, train_on_input)
+        tokens, mask = tokenizer.tokenize_messages(messages, max_seq_len)
+        tokens = tokens[:max_seq_len]
+        return torch.tensor(tokens, dtype = torch.int32, device = 'cpu')
+    return sharegpt_chat_tokenize_func
 
 def load_slimorca_dataset(
     tokenizer: Tokenizer,
     max_seq_len: Optional[int] = None,
+    # TODO: `train_on_input` currently has no effect.  Fix or remove it.
     train_on_input: bool = False,
+    split: str = 'train',
     **kwargs,
-) -> Tuple[DistributedSampler, DataLoader]:
-    dataset = slimorca_dataset(
-        tokenizer=tokenizer,
-        max_seq_len=max_seq_len,
-        train_on_input=True,
+) -> DatasetAdapter:
+    return MapDatasetAdapter(
+        load_dataset('Open-Orca/SlimOrca-Dedup', split = split, **kwargs),
+        make_sharegpt_chat_tokenize_func(tokenizer, max_seq_len, train_on_input),
     )
-    return build_data_loader(dataset, tokenizer, **kwargs)
 
 def load_wikitext_dataset(
     tokenizer: Tokenizer,
     max_seq_len: Optional[int] = None,
+    name: str = 'wikitext-2-raw-v1',
+    split: str = 'test',
     **kwargs,
-) -> Tuple[DistributedSampler, DataLoader]:
-    dataset = TextDataset(
-        tokenizer=tokenizer,
-        max_seq_len=max_seq_len,
-        source='wikitext',
-        name='wikitext-2-raw-v1',
-        split='test',
+) -> DatasetAdapter:
+    return MapDatasetAdapter(
+        load_dataset('wikitext', name = name, split = split, **kwargs),
+        make_tokenize_func(tokenizer, max_seq_len),
     )
-    return build_data_loader(dataset, tokenizer, **kwargs)
