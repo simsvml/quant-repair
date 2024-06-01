@@ -74,7 +74,7 @@ def run():
 
     if lora_path is not None:
         print('loading trained lora from %r' % (lora_path,))
-        lora_state_dict = torch.load(lora_path)
+        lora_state_dict = torch.load(lora_path, weights_only = True)
         if 'params' in lora_state_dict:
             lora_state_dict = lora_state_dict['params']
         lora_loader = StateDictLoader(lora_state_dict)

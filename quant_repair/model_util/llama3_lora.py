@@ -159,12 +159,12 @@ def save_trainable_params(params: TrainableParams) -> Dict[str, Any]:
     state_dict = {}
 
     def save_low_rank_adapter_params(name, params):
-        state_dict[name + '.lora_a'] = params.lora_a
-        state_dict[name + '.lora_b'] = params.lora_b
+        state_dict[name + '.lora_a'] = params.lora_a.to_dict()
+        state_dict[name + '.lora_b'] = params.lora_b.to_dict()
         state_dict[name + '.lora_alpha'] = params.lora_alpha
 
     def save_rms_norm_params(name ,params):
-        state_dict[name + '.scale'] = params.scale
+        state_dict[name + '.scale'] = params.scale.to_dict()
 
     def save_layer_trainable_params(name, params):
         save_low_rank_adapter_params(name + '.q_proj', params.q_proj)

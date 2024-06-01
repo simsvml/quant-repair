@@ -1,5 +1,6 @@
+import dataclasses
 from dataclasses import dataclass
-from typing import Any, Optional, List
+from typing import Any, Optional, List, Dict
 import torch
 from torch import Tensor
 from torch import nn
@@ -21,11 +22,35 @@ class TensorParams:
         )
         return TensorParams(data = x, dequant = dq)
 
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Convert to a dict for serialization.  The output uses only built-in
+        Python types, so it can be deserialized by `torch.load` in
+        `weights_only` mode.
+        """
+        return {
+            'data': self.data,
+            'dequant': self.dequant.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> 'TensorParams':
+        return cls(
+            data = d['data'],
+            dequant = quantized.DequantizeParams.from_dict(d['dequant']),
+        )
+
     def tensors(self):
         yield self.data
 
     def get(self) -> Tensor:
         return self.dequant.apply(self.data)
+
+    def to(self, device: torch.device) -> 'TensorParams':
+        return TensorParams(
+            data = self.data.to(device),
+            dequant = self.dequant,
+        )
 
 
 @dataclass(frozen=True)

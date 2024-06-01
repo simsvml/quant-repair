@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple, Dict
 import torch
 from torch import Tensor
 from torch import nn
@@ -78,6 +78,36 @@ class DequantizeParams:
         y = buf.view(self.shape[:-1] + (padded_row_dim,))
         y = y[..., 0:row_dim]
         return y.to(dtype)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Convert to a dict for serialization.  The output uses only built-in
+        Python types, so it can be deserialized by `torch.load` in
+        `weights_only` mode.
+        """
+        return {
+            'quant': int(self.quant),
+            'shape': self.shape,
+            # Some `torch.dtype` values are not allowed in `weights_only` mode,
+            # so we encode the dtype as a GGML quant type.
+            'dtype': int(TORCH_DTYPE_TO_QUANT[self.dtype]) if self.dtype is not None else None,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> 'DequantizeParams':
+        raw_dtype = d['dtype']
+        if raw_dtype is None:
+            dtype = None
+        # TODO: Remove this case (back compat with unreleased dev version)
+        elif isinstance(raw_dtype, torch.dtype):
+            dtype = raw_dtype
+        else:
+            dtype = UNQUANTIZED_TORCH_DTYPE[GGMLQuantizationType(raw_dtype)]
+        return cls(
+            quant = GGMLQuantizationType(d['quant']),
+            shape = d['shape'],
+            dtype = dtype,
+        )
 
 # Mostly copied from the `LinearFunction` examples in the PyTorch docs:
 # http://pytorch.org/docs/master/notes/extending.html

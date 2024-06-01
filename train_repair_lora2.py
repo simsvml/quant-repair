@@ -383,7 +383,7 @@ def run_init(config_path, checkpoint_path):
 
 def run_train(checkpoint_path):
     print('loading checkpoint from %r' % checkpoint_path)
-    checkpoint_dict = torch.load(checkpoint_path)
+    checkpoint_dict = torch.load(checkpoint_path, weights_only = True)
     cfg_dict = checkpoint_dict['cfg']
     cfg = Config.from_dict(cfg_dict)
     cfg_dict = config_as_dict(cfg)
@@ -820,7 +820,7 @@ def run_extract_config(checkpoint_path):
     MEMORY_ACCOUNTING.disable()
 
     print('loading checkpoint from %r' % checkpoint_path, file=sys.stderr)
-    checkpoint_dict = torch.load(checkpoint_path, map_location = 'meta')
+    checkpoint_dict = torch.load(checkpoint_path, weights_only = True, map_location = 'meta')
     cfg_dict = checkpoint_dict['cfg']
     cfg = Config.from_dict(cfg_dict)
 
@@ -872,7 +872,7 @@ def run_extract_config(checkpoint_path):
 
 def run_update_config(checkpoint_path, config_path):
     print('loading checkpoint from %r' % checkpoint_path)
-    checkpoint_dict = torch.load(checkpoint_path, map_location = 'meta')
+    checkpoint_dict = torch.load(checkpoint_path, weights_only = True, map_location = 'cpu')
     old_cfg_dict = checkpoint_dict['cfg']
     old_cfg = Config.from_dict(old_cfg_dict)
     old_cfg_dict = config_as_dict(old_cfg)

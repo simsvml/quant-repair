@@ -154,7 +154,9 @@ class StateDictLoader:
         self.tensors = {}
         self.metadata = {}
         for key, value in state_dict.items():
-            if not isinstance(value, (Tensor, TensorParams)):
+            # TODO: Detect TensorParams dict format, or combine self.tensors
+            # and self.metadata
+            if not isinstance(value, (Tensor, TensorParams, dict)):
                 self.metadata[key] = value
                 continue
             try:
@@ -174,7 +176,7 @@ class StateDictLoader:
         path: str,
         convert: Optional[WeightConversion] = NO_CONVERSION,
     ) -> 'StateDictLoader':
-        return cls(torch.load(path), convert = convert)
+        return cls(torch.load(path, weights_only = True), convert = convert)
 
     def has(self, key: str) -> bool:
         return key in self.tensors
@@ -185,11 +187,10 @@ class StateDictLoader:
             new_tensor = self.convert.tensor_to_torchtune(key, tensor)
             return TensorParams.from_unquantized_tensor(new_tensor.to(device = device))
         else:
+            if not isinstance(tensor, TensorParams):
+                tensor = TensorParams.from_dict(tensor)
             assert self.convert.transform_to_torchtune is None
-            return TensorParams(
-                data = tensor.data.to(device = device),
-                dequant = tensor.dequant,
-            )
+            return tensor.to(device)
 
     def get_meta(self, key: str) -> Any:
         return self.metadata[key]
