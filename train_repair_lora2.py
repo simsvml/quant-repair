@@ -585,6 +585,7 @@ def run_train(checkpoint_path):
 
     gradient_accumulation_steps = cfg.train.gradient_accumulation_steps
 
+    # Overall training progress, counted by number of tokens processed.
     pbar_tokens = tqdm(
         desc = 'tokens',
         total = cfg.train.total_tokens,
@@ -592,15 +593,19 @@ def run_train(checkpoint_path):
         smoothing = 0,
         unit_scale = True,
     )
+    # Progress through the current superbatch, in tokens.
     pbar_super_tokens = tqdm(
         desc = 'superbatch tokens',
-        total = cfg.train.total_tokens,
-        initial = progress['tokens'],
+        total = 1,
         unit_scale = True,
     )
+    # Superbatch forward pass progress, in layers finished.
     pbar_super_forward = tqdm(desc = 'superbatch forward', total = 2 + arch.num_layers)
+    # Superbatch layer progress, in samples processed.
     pbar_super_layer = tqdm(desc = 'superbatch layer', total = 1)
+    # Training forward pass progress, in layers.
     pbar_train_forward = tqdm(desc = 'train forward', total = 1)
+    # Training backward pass progress, in layers.
     pbar_train_backward = tqdm(desc = 'train backward', total = 1)
 
     def collect_batch_coroutine(samples):
@@ -631,6 +636,7 @@ def run_train(checkpoint_path):
             # sample would put us over, or we've exhausted the dataset.
             break
 
+        pbar_super_tokens.reset(sum(s.numel() for s in superbatch_samples))
         run_forward_superbatch(
             model,
             orig_loader,
@@ -640,7 +646,10 @@ def run_train(checkpoint_path):
             pbar_forward = pbar_super_forward,
             pbar_layer = pbar_super_layer,
         )
-        pbar_super_tokens.update(sum(s.numel() for s in superbatch_samples))
+
+        # Reset a second time so the estimated time remaining only considers
+        # actual training steps, not the superbatch forward pass.
+        pbar_super_tokens.reset(sum(s.numel() for s in superbatch_samples))
 
         MEMORY_ACCOUNTING.report('after orig forward pass')
 
@@ -782,6 +791,7 @@ def run_train(checkpoint_path):
             MEMORY_ACCOUNTING.report('after optimizer')
 
             pbar_tokens.update(batch_tokens)
+            pbar_super_tokens.update(batch_tokens)
 
 
             write_log(dict(
