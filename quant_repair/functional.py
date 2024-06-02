@@ -1,6 +1,6 @@
 import dataclasses
 from dataclasses import dataclass
-from typing import Any, Optional, List, Dict
+from typing import Any, Optional, List, Dict, Callable
 import torch
 from torch import Tensor
 from torch import nn
@@ -49,6 +49,12 @@ class TensorParams:
     def to(self, device: torch.device) -> 'TensorParams':
         return TensorParams(
             data = self.data.to(device),
+            dequant = self.dequant,
+        )
+
+    def map(self, f: Callable[[Tensor], Tensor]) -> 'TensorParams':
+        return TensorParams(
+            data = f(self.data),
             dequant = self.dequant,
         )
 

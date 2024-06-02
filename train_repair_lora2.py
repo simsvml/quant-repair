@@ -16,12 +16,13 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from torchtune.models.llama3 import llama3_tokenizer_transformers
 from torchtune.modules import RotaryPositionalEmbeddings
-from gguf import GGUFReader
+from gguf import GGUFReader, GGUFWriter
 from tqdm import tqdm
 from quant_repair.architecture import Llama3Arch
 from quant_repair import datasets
 from quant_repair.forward import SuperbatchEmbeddings
 from quant_repair import functional as QRF
+import quant_repair.gguf
 import quant_repair.loader
 from quant_repair.loader import StateDictLoader, SafetensorsLoader, GGUFLoader
 from quant_repair.memory_accounting import MEMORY_ACCOUNTING
@@ -29,6 +30,7 @@ from quant_repair import model_util as QRM
 from quant_repair.model_util.llama3_lora import TrainableParams, LayerTrainableParams
 from quant_repair.model_util.superbatch import run_forward_superbatch
 from quant_repair.offload import TensorOffload
+from quant_repair import quantized
 from quant_repair.quantized import DequantizeParams
 
 
@@ -295,7 +297,7 @@ def run_init(config_path, checkpoint_path):
         answer = input('Overwrite? ')
         if answer.lower() not in ('y', 'yes'):
             print('Operation cancelled')
-            sys.exit(1)
+            return
 
 
     arch = get_model_arch(cfg.model_arch)
@@ -929,8 +931,90 @@ def run_update_config(checkpoint_path, config_path):
     print('updated %r' % checkpoint_path)
 
 
+def run_export_gguf(checkpoint_path, gguf_path):
+    if os.path.exists(gguf_path):
+        print('Refusing to overwrite existing file %r' % gguf_path)
+        return
+
+    MEMORY_ACCOUNTING.disable()
+
+    print('loading checkpoint from %r' % checkpoint_path)
+    checkpoint_dict = torch.load(checkpoint_path, weights_only = True, map_location = 'cpu')
+    cfg = Config.from_dict(checkpoint_dict['cfg'])
+
+    arch = get_model_arch(cfg.model_arch)
+    device = torch.device('cpu')
+
+    print('loading params from checkpoint')
+    param_loader = StateDictLoader(checkpoint_dict['params'])
+    with torch.no_grad():
+        train_params = QRM.llama3_lora.load_trainable_params(
+            param_loader, arch.num_layers, device)
+
+    print('loading original gguf from %r' % cfg.quant_weights_gguf_path)
+    reader = quant_repair.gguf.GGUFReader2(cfg.quant_weights_gguf_path)
+
+    writer = quant_repair.gguf.GGUFWriter2(gguf_path)
+
+    new_arch = 'llamawithlora'
+    writer.write_kv_str('general.architecture', new_arch)
+    arch_dot = reader.architecture + '.'
+    for kv in reader.kvs:
+        if kv.key == 'general.architecture':
+            continue
+        if kv.key.startswith(arch_dot):
+            new_key = '%s.%s' % (new_arch, kv.key[len(arch_dot):])
+            writer.copy_kv_with_key(reader, new_key, kv)
+        else:
+            writer.copy_kv(reader, kv)
 
 
+    copied_tensors = [t for t in reader.tensors if 'norm.weight' not in t.name]
+    writer.copy_tensors(reader, copied_tensors)
+
+    tensor_data = {}
+    def add_tensor(name: str, tensor: QRF.TensorParams, transpose: bool = False):
+        if not transpose:
+            dimensions = tuple(reversed(tensor.dequant.shape))
+        else:
+            assert len(tensor.dequant.shape) == 2
+            dimensions = tuple(tensor.dequant.shape)
+        type_ = quant_repair.gguf.GGMLQuantizationType(int(tensor.dequant.quant))
+        writer.add_tensor(name, dimensions, type_)
+        tensor_data[name] = tensor.data.detach()
+        if transpose:
+            tensor_data[name] = tensor_data[name].t().contiguous()
+    def add_lora(
+        name: str,
+        params: QRF.LowRankAdapterParams,
+        transpose_a: bool = False,
+        transpose_b: bool = False,
+    ):
+        add_tensor(name + '.lora_a', params.lora_a.map(lambda t: t * params.lora_alpha),
+            transpose = transpose_a)
+        add_tensor(name + '.lora_b', params.lora_b, transpose = transpose_b)
+
+    add_lora('token_embd.weight', train_params.tok_embeddings, transpose_a = True)
+    for i, layer in enumerate(train_params.layers):
+        add_lora('blk.%d.attn_q.weight' % i, layer.q_proj)
+        add_lora('blk.%d.attn_k.weight' % i, layer.k_proj)
+        add_lora('blk.%d.attn_v.weight' % i, layer.v_proj)
+        add_lora('blk.%d.attn_output.weight' % i, layer.output_proj)
+        add_lora('blk.%d.ffn_gate.weight' % i, layer.gate_proj)
+        add_lora('blk.%d.ffn_down.weight' % i, layer.down_proj)
+        add_lora('blk.%d.ffn_up.weight' % i, layer.up_proj)
+        add_tensor('blk.%d.attn_norm.weight' % i, layer.sa_norm.scale)
+        add_tensor('blk.%d.ffn_norm.weight' % i, layer.mlp_norm.scale)
+    add_tensor('output_norm.weight', train_params.norm.scale)
+    add_lora('output.weight', train_params.output)
+
+    writer.finish_header()
+
+    writer.copy_tensor_data(reader, copied_tensors)
+    for name, data in tensor_data.items():
+        writer.write_tensor_data(name, data.view(torch.uint8).numpy())
+
+    writer.finish_data()
 
 
 
@@ -964,6 +1048,11 @@ def main():
             checkpoint_path = sys.argv[2]
             config_path = sys.argv[3]
             run_update_config(checkpoint_path, config_path)
+        elif mode == 'export_gguf':
+            assert len(sys.argv) == 4
+            checkpoint_path = sys.argv[2]
+            gguf_path = sys.argv[3]
+            run_export_gguf(checkpoint_path, gguf_path)
         else:
             raise ValueError('unknown mode %r' % mode)
     finally:
