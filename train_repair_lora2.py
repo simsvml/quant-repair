@@ -32,6 +32,7 @@ from quant_repair.model_util.superbatch import run_forward_superbatch
 from quant_repair.offload import TensorOffload
 from quant_repair import quantized
 from quant_repair.quantized import DequantizeParams
+import torch_ggml_quant
 
 
 def config_as_dict(x) -> dict:
@@ -931,7 +932,7 @@ def run_update_config(checkpoint_path, config_path):
     print('updated %r' % checkpoint_path)
 
 
-def run_export_gguf(checkpoint_path, gguf_path):
+def run_export_gguf(checkpoint_path, gguf_path, quantize_lora = False):
     if os.path.exists(gguf_path):
         print('Refusing to overwrite existing file %r' % gguf_path)
         return
@@ -953,10 +954,15 @@ def run_export_gguf(checkpoint_path, gguf_path):
 
     print('loading original gguf from %r' % cfg.quant_weights_gguf_path)
     reader = quant_repair.gguf.GGUFReader2(cfg.quant_weights_gguf_path)
+    #reader = quant_repair.gguf.GGUFReader2(cfg.quant_weights_gguf_path
+    #    .replace('_XXS.', '_XS.'))
 
     writer = quant_repair.gguf.GGUFWriter2(gguf_path)
 
-    new_arch = 'llamawithlora'
+    # Copy KV entries.  We adjust the architecture from `llama` to
+    # `llamawithlora`, which requires updating key names that are prefixed with
+    # the old architecture name.
+    new_arch = reader.architecture + 'withlora'
     writer.write_kv_str('general.architecture', new_arch)
     arch_dot = reader.architecture + '.'
     for kv in reader.kvs:
@@ -968,22 +974,62 @@ def run_export_gguf(checkpoint_path, gguf_path):
         else:
             writer.copy_kv(reader, kv)
 
+    # Add tensors.
 
+    # Copy tensor descriptions from the quantized model GGUF.  Norm weights
+    # are excluded in favor of the trained versions from the checkpoint.
     copied_tensors = [t for t in reader.tensors if 'norm.weight' not in t.name]
     writer.copy_tensors(reader, copied_tensors)
 
     tensor_data = {}
-    def add_tensor(name: str, tensor: QRF.TensorParams, transpose: bool = False):
+    def add_tensor(
+        name: str,
+        tensor: QRF.TensorParams,
+        transpose: bool = False,
+        quantize: bool = False,
+    ):
         if not transpose:
             dimensions = tuple(reversed(tensor.dequant.shape))
         else:
             assert len(tensor.dequant.shape) == 2
             dimensions = tuple(tensor.dequant.shape)
-        type_ = quant_repair.gguf.GGMLQuantizationType(int(tensor.dequant.quant))
+
+        if not quantize:
+            type_ = quant_repair.gguf.GGMLQuantizationType(int(tensor.dequant.quant))
+            data = tensor.data.detach()
+            if transpose:
+                assert tensor.dequant.quant in quantized.UNQUANTIZED_TYPES, \
+                    "can't transpose a quantized tensor (type %s)" % tensor.dequant.quant.name
+                data = data.t().contiguous()
+        else:
+            data_f32 = DequantizeParams(
+                quant = tensor.dequant.quant,
+                shape = tensor.dequant.shape,
+                dtype = torch.float32,
+            ).apply(tensor.data)
+            if transpose:
+                data_f32 = data_f32.t()
+            data_f32 = data_f32.contiguous()
+
+            quant = quant_repair.gguf.GGMLQuantizationType.Q8_0
+            assert (
+                data_f32.shape[-1] % torch_ggml_quant.quant_format_values_per_block(quant) == 0
+            ), "can't quantize lora - not a multiple of quant block size"
+            print('quantize %s to format %s' % (name, quant.name))
+            data_f32 = data_f32.view(-1, torch_ggml_quant.quant_format_values_per_block(quant))
+            data = torch.empty(
+                (data_f32.shape[0], torch_ggml_quant.quant_format_block_size(quant)),
+                dtype = torch.uint8,
+                device = 'cpu',
+            )
+            torch_ggml_quant.quantize_fp32_cpu(data_f32, data, quant)
+            data = data.view(-1)
+
+            type_ = quant
+
         writer.add_tensor(name, dimensions, type_)
-        tensor_data[name] = tensor.data.detach()
-        if transpose:
-            tensor_data[name] = tensor_data[name].t().contiguous()
+        tensor_data[name] = data
+
     def add_lora(
         name: str,
         params: QRF.LowRankAdapterParams,
@@ -991,8 +1037,9 @@ def run_export_gguf(checkpoint_path, gguf_path):
         transpose_b: bool = False,
     ):
         add_tensor(name + '.lora_a', params.lora_a.map(lambda t: t * params.lora_alpha),
-            transpose = transpose_a)
-        add_tensor(name + '.lora_b', params.lora_b, transpose = transpose_b)
+            transpose = transpose_a, quantize = quantize_lora)
+        add_tensor(name + '.lora_b', params.lora_b,
+            transpose = transpose_b, quantize = quantize_lora)
 
     add_lora('token_embd.weight', train_params.tok_embeddings, transpose_a = True)
     for i, layer in enumerate(train_params.layers):
@@ -1008,11 +1055,20 @@ def run_export_gguf(checkpoint_path, gguf_path):
     add_tensor('output_norm.weight', train_params.norm.scale)
     add_lora('output.weight', train_params.output)
 
+
     writer.finish_header()
 
+
+    # Write tensor data
+
+    # Copy all the tensor data from the quantized GGUF.  We copy the norm
+    # weights even though they're unused because they're small and finding
+    # the end of each tensor's data requires additional logic.
     writer.copy_tensor_data(reader, copied_tensors)
+
     for name, data in tensor_data.items():
         writer.write_tensor_data(name, data.view(torch.uint8).numpy())
+
 
     writer.finish_data()
 
@@ -1053,6 +1109,11 @@ def main():
             checkpoint_path = sys.argv[2]
             gguf_path = sys.argv[3]
             run_export_gguf(checkpoint_path, gguf_path)
+        elif mode == 'export_gguf_quantized':
+            assert len(sys.argv) == 4
+            checkpoint_path = sys.argv[2]
+            gguf_path = sys.argv[3]
+            run_export_gguf(checkpoint_path, gguf_path, quantize_lora = True)
         else:
             raise ValueError('unknown mode %r' % mode)
     finally:
