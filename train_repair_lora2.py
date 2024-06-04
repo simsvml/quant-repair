@@ -965,10 +965,6 @@ def run_export_gguf(
     lora_only = False,
     quantize_lora = False,
 ):
-    if os.path.exists(gguf_path):
-        print('Refusing to overwrite existing file %r' % gguf_path)
-        return
-
     MEMORY_ACCOUNTING.disable()
 
     print('loading checkpoint from %r' % checkpoint_path)
@@ -1031,6 +1027,10 @@ def run_export_gguf(
         if not quantize:
             type_ = quant_repair.gguf.GGMLQuantizationType(int(tensor.dequant.quant))
             data = tensor.data.detach()
+            if type_ == quant_repair.gguf.GGMLQuantizationType.BF16:
+                # BF16 is not well supported by llama.cpp.  Convert to FP16.
+                type_ = quant_repair.gguf.GGMLQuantizationType.F16
+                data = data.to(torch.float16)
             if transpose:
                 assert tensor.dequant.quant in quantized.UNQUANTIZED_TYPES, \
                     "can't transpose a quantized tensor (type %s)" % tensor.dequant.quant.name
