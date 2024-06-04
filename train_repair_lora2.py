@@ -820,7 +820,7 @@ def run_train(checkpoint_path):
     save_checkpoint()
 
 
-def run_extract_config(checkpoint_path):
+def run_extract_config(checkpoint_path, out_path = None):
     # Disable printing the final memory report.  The report normally goes to
     # stdout, which would interfere with redirecting the config toml to a file.
     MEMORY_ACCOUNTING.disable()
@@ -884,7 +884,13 @@ def run_extract_config(checkpoint_path):
     assert cfg_dict_orig == cfg_dict_reparsed, \
             "sanity check failed - printed TOML doesn't match original"
 
-    print(toml_str)
+    if out_path is None:
+        print(toml_str)
+    else:
+        with open(out_path, 'w') as f:
+            f.write(toml_str)
+            f.write('\n')
+        print('wrote config to %r' % out_path)
 
 def run_update_config(checkpoint_path, config_path):
     print('loading checkpoint from %r' % checkpoint_path)
@@ -968,8 +974,7 @@ def run_export_gguf(
     MEMORY_ACCOUNTING.disable()
 
     print('loading checkpoint from %r' % checkpoint_path)
-    #checkpoint_dict = torch.load(checkpoint_path, weights_only = True, map_location = 'cpu')
-    checkpoint_dict = torch.load(checkpoint_path, map_location = 'cpu')
+    checkpoint_dict = torch.load(checkpoint_path, weights_only = True, map_location = 'cpu')
     cfg = Config.from_dict(checkpoint_dict['cfg'])
 
     arch = get_model_arch(cfg.model_arch)
@@ -1163,7 +1168,7 @@ def main():
             run_init(args.config_path, args.checkpoint_path)
             run_train(args.checkpoint_path)
         elif args.cmd == 'extract_config':
-            run_extract_config(args.checkpoint_path)
+            run_extract_config(args.checkpoint_path, out_path = args.output)
         elif args.cmd == 'update_config':
             run_update_config(args.checkpoint_path, args.config_path)
         elif args.cmd == 'export_gguf':

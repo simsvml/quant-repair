@@ -4,8 +4,12 @@ import numpy as np
 import os
 import struct
 import tempfile
-from tqdm import tqdm
 from typing import Any, Optional, Sequence
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = lambda it, **kwargs: it
 
 
 # BEGIN code copied from gguf-py/gguf/constants.py

@@ -31,6 +31,16 @@ models.
     checkpoint.  You can stop the training at any time with `^C` and resume it
     from the latest checkpoint by running the same command again.
 
+4.  Build GGUF:
+
+    ```sh
+    python3 train_repair_lora2.py export_gguf checkpoint.pt out.gguf
+    ```
+
+    This will copy the quantized model from the config, add the LoRA weights
+    from `checkpoint.pt`, and write the result to `out.gguf`.  The new GGUF can
+    be used with [this branch of llama.cpp](https://github.com/simsvml/llama.cpp/tree/llama-with-lora).
+
 
 ## Reconfiguring an existing checkpoint
 
