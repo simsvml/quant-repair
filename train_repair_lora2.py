@@ -1,3 +1,4 @@
+import argparse
 import dataclasses
 from dataclasses import dataclass
 import itertools
@@ -955,7 +956,13 @@ def run_update_config(checkpoint_path, config_path):
     print('updated %r' % checkpoint_path)
 
 
-def run_export_gguf(checkpoint_path, gguf_path, quantize_lora = False):
+def run_export_gguf(
+    checkpoint_path,
+    gguf_path,
+    model_gguf_path = None,
+    lora_only = False,
+    quantize_lora = False,
+):
     if os.path.exists(gguf_path):
         print('Refusing to overwrite existing file %r' % gguf_path)
         return
@@ -963,7 +970,8 @@ def run_export_gguf(checkpoint_path, gguf_path, quantize_lora = False):
     MEMORY_ACCOUNTING.disable()
 
     print('loading checkpoint from %r' % checkpoint_path)
-    checkpoint_dict = torch.load(checkpoint_path, weights_only = True, map_location = 'cpu')
+    #checkpoint_dict = torch.load(checkpoint_path, weights_only = True, map_location = 'cpu')
+    checkpoint_dict = torch.load(checkpoint_path, map_location = 'cpu')
     cfg = Config.from_dict(checkpoint_dict['cfg'])
 
     arch = get_model_arch(cfg.model_arch)
@@ -975,10 +983,10 @@ def run_export_gguf(checkpoint_path, gguf_path, quantize_lora = False):
         train_params = QRM.llama3_lora.load_trainable_params(
             param_loader, arch.num_layers, device)
 
-    print('loading original gguf from %r' % cfg.quant_weights_gguf_path)
-    reader = quant_repair.gguf.GGUFReader2(cfg.quant_weights_gguf_path)
-    #reader = quant_repair.gguf.GGUFReader2(cfg.quant_weights_gguf_path
-    #    .replace('_XXS.', '_XS.'))
+    if model_gguf_path is None:
+        model_gguf_path = cfg.quant_weights_gguf_path
+    print('loading original gguf from %r' % model_gguf_path)
+    reader = quant_repair.gguf.GGUFReader2(model_gguf_path)
 
     writer = quant_repair.gguf.GGUFWriter2(gguf_path)
 
@@ -999,10 +1007,11 @@ def run_export_gguf(checkpoint_path, gguf_path, quantize_lora = False):
 
     # Add tensors.
 
-    # Copy tensor descriptions from the quantized model GGUF.  Norm weights
-    # are excluded in favor of the trained versions from the checkpoint.
-    copied_tensors = [t for t in reader.tensors if 'norm.weight' not in t.name]
-    writer.copy_tensors(reader, copied_tensors)
+    if not lora_only:
+        # Copy tensor descriptions from the quantized model GGUF.  Norm weights
+        # are excluded in favor of the trained versions from the checkpoint.
+        copied_tensors = [t for t in reader.tensors if 'norm.weight' not in t.name]
+        writer.copy_tensors(reader, copied_tensors)
 
     tensor_data = {}
     def add_tensor(
@@ -1084,10 +1093,11 @@ def run_export_gguf(checkpoint_path, gguf_path, quantize_lora = False):
 
     # Write tensor data
 
-    # Copy all the tensor data from the quantized GGUF.  We copy the norm
-    # weights even though they're unused because they're small and finding
-    # the end of each tensor's data requires additional logic.
-    writer.copy_tensor_data(reader, copied_tensors)
+    if not lora_only:
+        # Copy all the tensor data from the quantized GGUF.  We copy the norm
+        # weights even though they're unused because they're small and finding
+        # the end of each tensor's data requires additional logic.
+        writer.copy_tensor_data(reader, copied_tensors)
 
     for name, data in tensor_data.items():
         writer.write_tensor_data(name, data.view(torch.uint8).numpy())
@@ -1097,46 +1107,71 @@ def run_export_gguf(checkpoint_path, gguf_path, quantize_lora = False):
 
 
 
-
 def main():
-    assert len(sys.argv) >= 2
-    mode = sys.argv[1]
+    parser = argparse.ArgumentParser(
+        description =' train a LoRA to improve performance of a quantized model',
+    )
+    sub = parser.add_subparsers(required = True, dest = 'cmd')
+
+    cmd = sub.add_parser('init',
+        description = 'create a new training checkpoint from a config file')
+    cmd.add_argument('config_path', metavar = 'CONFIG.toml')
+    cmd.add_argument('checkpoint_path', metavar = 'CHECKPOINT.pt')
+
+    cmd = sub.add_parser('train',
+        description = 'continue training from a checkpoint')
+    cmd.add_argument('checkpoint_path', metavar = 'CHECKPOINT.pt')
+
+    cmd = sub.add_parser('init_and_train',
+        description = 'init a new checkpoint and start training')
+    cmd.add_argument('config_path', metavar = 'CONFIG.toml')
+    cmd.add_argument('checkpoint_path', metavar = 'CHECKPOINT.pt')
+
+    cmd = sub.add_parser('extract_config',
+        description = 'extract the training config from a checkpoint')
+    cmd.add_argument('checkpoint_path', metavar = 'CHECKPOINT.pt')
+    cmd.add_argument('-o', '--output', metavar = 'CONFIG.toml',
+        help = 'write config to CONFIG.toml (default: stdout)')
+
+    cmd = sub.add_parser('update_config',
+        description = 'replace the config in CHECKPOINT.pt with CONFIG.toml')
+    cmd.add_argument('checkpoint_path', metavar = 'CHECKPOINT.pt')
+    cmd.add_argument('config_path', metavar = 'CONFIG.toml')
+
+    cmd = sub.add_parser('export_gguf',
+        description = 'add LoRA weights to model and write to OUT.gguf')
+    cmd.add_argument('checkpoint_path', metavar = 'CHECKPOINT.pt')
+    cmd.add_argument('gguf_path', metavar = 'OUT.gguf')
+    cmd.add_argument('--lora-only', action = 'store_true',
+        help = "write LoRA weights only; don't copy model weights into OUT.gguf")
+    cmd.add_argument('-q', '--quantize', action = 'store_true',
+        help = 'quantize the LoRA weights to Q8_0')
+    cmd.add_argument('-m', '--model', metavar = 'MODEL.gguf',
+        help = 'read model from MODEL.gguf (default: use model listed in checkpoint config)')
+
+
+    args = parser.parse_args()
 
     try:
-        if mode == 'init':
-            assert len(sys.argv) == 4
-            config_path = sys.argv[2]
-            checkpoint_path = sys.argv[3]
-            run_init(config_path, checkpoint_path)
-        elif mode == 'train':
-            assert len(sys.argv) == 3
-            checkpoint_path = sys.argv[2]
-            run_train(checkpoint_path)
-        elif mode == 'init_and_train':
-            assert len(sys.argv) == 4
-            config_path = sys.argv[2]
-            checkpoint_path = sys.argv[3]
-            run_init(config_path, checkpoint_path)
-            run_train(checkpoint_path)
-        elif mode == 'extract_config':
-            assert len(sys.argv) == 3
-            checkpoint_path = sys.argv[2]
-            run_extract_config(checkpoint_path)
-        elif mode == 'update_config':
-            assert len(sys.argv) == 4
-            checkpoint_path = sys.argv[2]
-            config_path = sys.argv[3]
-            run_update_config(checkpoint_path, config_path)
-        elif mode == 'export_gguf':
-            assert len(sys.argv) == 4
-            checkpoint_path = sys.argv[2]
-            gguf_path = sys.argv[3]
-            run_export_gguf(checkpoint_path, gguf_path)
-        elif mode == 'export_gguf_quantized':
-            assert len(sys.argv) == 4
-            checkpoint_path = sys.argv[2]
-            gguf_path = sys.argv[3]
-            run_export_gguf(checkpoint_path, gguf_path, quantize_lora = True)
+        if args.cmd == 'init':
+            run_init(args.config_path, args.checkpoint_path)
+        elif args.cmd == 'train':
+            run_train(args.checkpoint_path)
+        elif args.cmd == 'init_and_train':
+            run_init(args.config_path, args.checkpoint_path)
+            run_train(args.checkpoint_path)
+        elif args.cmd == 'extract_config':
+            run_extract_config(args.checkpoint_path)
+        elif args.cmd == 'update_config':
+            run_update_config(args.checkpoint_path, args.config_path)
+        elif args.cmd == 'export_gguf':
+            run_export_gguf(
+                args.checkpoint_path,
+                args.gguf_path,
+                lora_only = args.lora_only,
+                quantize_lora = args.quantize,
+                model_gguf_path = args.model,
+            )
         else:
             raise ValueError('unknown mode %r' % mode)
     finally:
