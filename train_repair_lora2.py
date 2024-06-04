@@ -458,6 +458,8 @@ def run_train(checkpoint_path):
     with torch.no_grad():
         train_params = QRM.llama3_lora.load_trainable_params(
             param_loader, arch.num_layers, device)
+    for tensor in train_params.tensors():
+        tensor.requires_grad_(True)
     MEMORY_ACCOUNTING.register_params(train_params, 'trainable params')
 
 
