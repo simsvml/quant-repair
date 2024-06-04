@@ -828,8 +828,9 @@ def run_extract_config(checkpoint_path):
     cfg = Config.from_dict(cfg_dict)
 
     lines = []
+    comment = ''
     def emit(line):
-        lines.append(line)
+        lines.append(comment + line)
 
     def emit_toml_key_value(key, value, prefix=''):
         if value is None:
@@ -837,10 +838,12 @@ def run_extract_config(checkpoint_path):
         elif isinstance(value, (int, float, str)):
             emit('%s = %r' % (key, value))
         elif isinstance(value, dict):
-            emit('\n[%s%s]' % (prefix, key))
+            emit('')
+            emit('[%s%s]' % (prefix, key))
             emit_dict_toml(value, prefix = '%s%s.' % (prefix, key))
         elif dataclasses.is_dataclass(value):
-            emit('\n[%s%s]' % (prefix, key))
+            emit('')
+            emit('[%s%s]' % (prefix, key))
             emit_cfg_toml(value, prefix = '%s%s.' % (prefix, key))
         else:
             raise TypeError('emit_cfg_toml: unknown type %r' % type(value))
@@ -861,9 +864,16 @@ def run_extract_config(checkpoint_path):
             prefix = prefix)
 
     def emit_dict_toml(d, prefix=''):
-        emit_toml_table(d.items(), prefix = prefix)
+        emit_toml_table(((k, d[k]) for k in sorted(d.keys())), prefix = prefix)
 
     emit_cfg_toml(cfg)
+
+    emit('')
+    emit('# Training progress override - expert users only')
+    comment = '#'
+    emit_toml_key_value('progress', checkpoint_dict['progress'])
+
+
 
     toml_str = '\n'.join(lines)
     cfg_dict_orig = config_as_dict(cfg)
@@ -877,15 +887,17 @@ def run_update_config(checkpoint_path, config_path):
     print('loading checkpoint from %r' % checkpoint_path)
     checkpoint_dict = torch.load(checkpoint_path, weights_only = True, map_location = 'cpu')
     old_cfg_dict = checkpoint_dict['cfg']
+    old_progress = checkpoint_dict['progress']
     old_cfg = Config.from_dict(old_cfg_dict)
     old_cfg_dict = config_as_dict(old_cfg)
 
     print('loading config from %r' % config_path)
     new_cfg_dict = tomllib.load(open(config_path, 'rb'))
+    new_progress = new_cfg_dict.pop('progress', None)
     new_cfg = Config.from_dict(new_cfg_dict)
     new_cfg_dict = config_as_dict(new_cfg)
 
-    if old_cfg_dict == new_cfg_dict:
+    if old_cfg_dict == new_cfg_dict and (new_progress is None or old_progress == new_progress):
         print('Configs already match; nothing to do')
         return
 
@@ -921,6 +933,14 @@ def run_update_config(checkpoint_path, config_path):
             if old_value != new_value:
                 print('  %s: %r -> %r' % (key, old_value, new_value))
 
+    if new_progress is not None:
+        for key in sorted(new_progress.keys()):
+            assert key in old_progress, 'unknown progress key %r' % key
+            old_value = old_progress[key]
+            new_value = new_progress[key]
+            if old_value != new_value:
+                print('  %s: %r -> %r' % (key, old_value, new_value))
+
     print()
     answer = input('Apply these changes? ')
     if answer.lower() not in ('y', 'yes'):
@@ -928,6 +948,9 @@ def run_update_config(checkpoint_path, config_path):
         return
 
     checkpoint_dict['cfg'] = new_cfg_dict
+    if new_progress is not None:
+        for key, value in new_progress.items():
+            checkpoint_dict['progress'][key] = value
     torch.save(checkpoint_dict, checkpoint_path)
     print('updated %r' % checkpoint_path)
 
